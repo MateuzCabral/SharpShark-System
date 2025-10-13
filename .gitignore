@@ -1,0 +1,91 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+env/
+.venv*/
+pip-wheel-metadata/
+*.egg-info/
+dist/
+build/
+uploads/
+
+# Arquivos de dependência cacheados
+*.egg
+.eggs/
+*.manifest
+*.spec
+
+# Logs e temporários
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.DS_Store
+*.coverage
+.coverage.*
+htmlcov/
+.coverage
+
+# Testes
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# Banco de dados (SQLite)
+*.db
+*.sqlite3
+*.sqlite
+
+# Configuração de ambiente
+.env
+.env.*
+!env.example 
+
+# Documentação / Sphinx
+docs/_build/
+docs/_static/
+docs/_templates/
+
+# FastAPI / Uvicorn
+*.pid
+*.sock
+
+# Caches
+__pycache__/
+*.pyo
+*.pyd
+*.class
+
+# Ferramentas
+.cache/
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Distribuição
+wheelhouse/
+*.whl
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Sistema
+Thumbs.db

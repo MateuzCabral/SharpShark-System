@@ -1,0 +1,13 @@
+alembic==1.16.5
+argon2-cffi==25.1.0
+argon2-cffi-bindings==25.1.0
+fastapi==0.118.0
+fastapi-cli==0.0.13
+fastapi-pagination==0.14.2
+passlib==1.7.4
+pydantic==2.11.9
+python-dotenv==1.1.1
+python-jose==3.5.0
+python-multipart==0.0.20
+SQLAlchemy==2.0.43
+uvicorn==0.37.0
