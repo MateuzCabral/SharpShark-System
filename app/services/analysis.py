@@ -6,6 +6,7 @@ from typing import Dict, Tuple
 from db.models import Analysis, Stream, Alert, Stat, IpRecord, File
 from datetime import datetime, timezone
 import pyshark
+import time
 
 UPLOAD_DIR = "./uploads"
 STREAMS_DIR = os.path.join(UPLOAD_DIR, "streams")
@@ -21,6 +22,7 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
     
+    start_time = time.perf_counter()
 
     pcap_path = file_obj.file_path
     analysis = Analysis(file_id=file_obj.id, user_id=file_obj.user_id, status="in_progress")
@@ -35,8 +37,6 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
     streams_map: Dict[str, Dict] = {}  
 
     total_packets = 0
-
-   
 
     try:
         
@@ -163,18 +163,33 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
         except Exception:
             pass
 
+        # Só processa se realmente houve pacotes
+        if total_packets == 0:
+            raise RuntimeError("Nenhum pacote foi capturado, possivelmente arquivo inválido ou vazio.")
+
         stream_count = 0
         for key, meta in streams_map.items():
-            stream_count += 1
             packets = meta["packets"]
+            if not packets:
+                continue  # pula streams vazios
+
+            # Verifica se há payload real
+            if not any(pkt["payload"] for pkt in packets):
+                continue
+
+            stream_count += 1
             stream_filename = f"{analysis.id}_stream_{stream_count}.bin"
             stream_path = os.path.join(STREAMS_DIR, stream_filename)
             with open(stream_path, "wb") as sf:
                 for pktmeta in packets:
-                    try:
-                        sf.write(pktmeta["payload"] or b"")
-                    except Exception:
-                        pass
+                    payload = pktmeta.get("payload")
+                    if payload:
+                        sf.write(payload)
+
+            # Se o arquivo ficou vazio (por segurança)
+            if os.path.getsize(stream_path) == 0:
+                os.remove(stream_path)
+                continue
 
             preview = ""
             try:
@@ -192,23 +207,33 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
             )
             session.add(stream_model)
 
+        # Grava estatísticas e IPs
         for proto, cnt in protocol_counts.items():
-            s = Stat(analysis_id=analysis.id, category="protocol", key=proto, count=cnt)
-            session.add(s)
+            session.add(Stat(analysis_id=analysis.id, category="protocol", key=proto, count=cnt))
 
-        for port, cnt in list(sorted(port_counts.items(), key=lambda x: x[1], reverse=True))[:50]:
-            s = Stat(analysis_id=analysis.id, category="port", key=str(port), count=cnt)
-            session.add(s)
+        for port, cnt in sorted(port_counts.items(), key=lambda x: x[1], reverse=True)[:50]:
+            session.add(Stat(analysis_id=analysis.id, category="port", key=str(port), count=cnt))
 
         for ip, cnt in ip_counts.items():
-            ipr = IpRecord(analysis_id=analysis.id, ip=ip, role="unknown", count=cnt,
-                           hostname="unknown", city="unknown", region="unknown", country="unknown", organization="unknown")
-            session.add(ipr)
+            session.add(IpRecord(
+                analysis_id=analysis.id,
+                ip=ip,
+                role="unknown",
+                count=cnt,
+                hostname="unknown",
+                city="unknown",
+                region="unknown",
+                country="unknown",
+                organization="unknown"
+            ))
 
+
+        end_time = time.perf_counter()
+       
         analysis.status = "completed"
         analysis.total_packets = total_packets
         analysis.total_streams = stream_count
-        analysis.duration = 0.0
+        analysis.duration = round(end_time - start_time, 3)
         analysis.analyzed_at = datetime.now(tz=timezone.utc)
 
         session.commit()
@@ -220,6 +245,13 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
         analysis.status = "failed"
         session.add(analysis)
         session.commit()
+
+        # Remove arquivos vazios caso a análise tenha falhado
+        for f in os.listdir(STREAMS_DIR):
+            path = os.path.join(STREAMS_DIR, f)
+            if os.path.isfile(path) and os.path.getsize(path) == 0:
+                os.remove(path)
+
         fail_alert = Alert(
             analysis_id=analysis.id,
             alert_type="analysis_error",

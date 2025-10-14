@@ -36,7 +36,7 @@ class File(Base):
     uploaded_at = Column(DateTime, default=datetime.now(tz=timezone.utc))
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
 
-    analysis = relationship("Analysis", back_populates="file")
+    analysis = relationship("Analysis", back_populates="file", cascade="all, delete-orphan")
     user = relationship("User")
 
     def __init__(self, file_name: str, file_path: str, file_size: float, file_hash: str, user_id: str):
