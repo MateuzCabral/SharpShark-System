@@ -24,23 +24,17 @@ def get_all_files(
     session: Session = Depends(get_session)
 ):
     query = file_service.get_files_query(session)
-    if not current_user.is_superuser:
-        query = query.filter(file_service.File.user_id == current_user.id)
     return paginate(query)
 
 
 @files_router.get("/{file_id}", response_model=FileRead)
 def get_file(file_id: str, current_user: User = Depends(require_active_user), session: Session = Depends(get_session)):
     file = file_service.get_file_by_id(session, file_id)
-    if file.user_id != current_user.id and not current_user.is_superuser:
-        raise HTTPException(status_code=403, detail="Sem permissão para acessar este arquivo")
     return file
 
 @files_router.get("/hash/{file_hash}", response_model=FileRead)
 def get_file_by_hash(file_hash: str, current_user: User = Depends(require_active_user), session: Session = Depends(get_session)):
     file = file_service.get_file_by_hash(session, file_hash)
-    if file.user_id != current_user.id and not current_user.is_superuser:
-        raise HTTPException(status_code=403, detail="Sem permissão para acessar este arquivo")
     return file
 
 @files_router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
