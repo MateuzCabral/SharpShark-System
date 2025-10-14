@@ -3,7 +3,7 @@ from typing import Optional
 
 class UserCreate(BaseModel):
     name: str = Field(..., min_length=3, max_length=150)
-    password: str = Field(..., min_length=8)
+    password: str = Field(..., min_length=8, max_length=64)
     is_active: Optional[bool] = True
     is_superuser: Optional[bool] = False
 
