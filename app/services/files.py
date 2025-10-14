@@ -3,6 +3,7 @@ from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 from db.models import File
 from api.schemas.dependencies import validate_pcap_header, calculate_file_hash 
+import services.analysis as analysis_service
 
 
 UPLOAD_DIR = "./uploads"
@@ -22,16 +23,22 @@ def create_file(session: Session, file: UploadFile, user_id: str) -> File:
     if existing:
         raise HTTPException(status_code=400, detail="Arquivo já foi registrado anteriormente")
 
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    filename = os.path.basename(file.filename)
+    file_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(file_path):
-        raise HTTPException(status_code=400, detail="Um arquivo com o mesmo nome já existe")
+        base, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(os.path.join(UPLOAD_DIR, f"{base}_{counter}{ext}")):
+            counter += 1
+        filename = f"{base}_{counter}{ext}"
+        file_path = os.path.join(UPLOAD_DIR, filename)
 
     with open(file_path, "wb") as buffer:
         buffer.write(file.file.read())
 
     file_size = os.path.getsize(file_path) / 1024 / 1024  # MB
     new_file = File(
-        file_name=file.filename,
+        file_name=filename,
         file_path=file_path,
         file_size=file_size,
         file_hash=file_hash,
@@ -40,6 +47,10 @@ def create_file(session: Session, file: UploadFile, user_id: str) -> File:
 
     session.add(new_file)
     session.commit()
+    session.refresh(new_file)
+
+    analysis_service.analyze_file(session, new_file)
+
     session.refresh(new_file)
     return new_file
 

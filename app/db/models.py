@@ -23,6 +23,7 @@ class User(Base):
         self.is_superuser = is_superuser
 
     files = relationship("File", back_populates="user", cascade="all, delete-orphan")
+    analysis = relationship("Analysis", back_populates="user", cascade="all, delete-orphan")
 
 class File(Base):
     __tablename__ = "files"
@@ -56,15 +57,18 @@ class Analysis(Base):
     duration = Column(Float, default=0.0)
     analyzed_at = Column(DateTime, default=datetime.now(tz=timezone.utc))
     file_id = Column(String, ForeignKey("files.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
 
     file = relationship("File", back_populates="analysis")
     streams = relationship("Stream", back_populates="analysis", cascade="all, delete-orphan")
     alerts = relationship("Alert", back_populates="analysis", cascade="all, delete-orphan")
     stats = relationship("Stat", back_populates="analysis", cascade="all, delete-orphan")
     ips = relationship("IpRecord", back_populates="analysis", cascade="all, delete-orphan")
+    user = relationship("User")
 
-    def __init__(self, file_id: str, status: str = "pending", total_packets: int = 0, total_streams: int = 0, duration: float = 0.0):
+    def __init__(self, file_id: str, user_id: str, status: str = "pending", total_packets: int = 0, total_streams: int = 0, duration: float = 0.0):
         self.file_id = file_id
+        self.user_id = user_id
         self.status = status
         self.total_packets = total_packets
         self.total_streams = total_streams
