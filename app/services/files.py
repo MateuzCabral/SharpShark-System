@@ -5,7 +5,6 @@ from db.models import File
 from api.schemas.dependencies import validate_pcap_header, calculate_file_hash 
 import services.analysis as analysis_service
 
-
 UPLOAD_DIR = "./uploads"
 
 
@@ -78,9 +77,22 @@ def delete_file(session: Session, file_id: str):
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
 
     try:
-        os.remove(file.file_path)
-    except FileNotFoundError:
-        pass
+        if os.path.exists(file.file_path):
+            os.remove(file.file_path)
+    except Exception as e:
+        print(f"[WARN] Erro ao remover arquivo principal: {e}")
+
+    try:
+        for analysis in file.analysis:
+            streams_dir = os.path.join("uploads", "streams")
+            for stream_file in os.listdir(streams_dir):
+                if stream_file.startswith(analysis.id):
+                    try:
+                        os.remove(os.path.join(streams_dir, stream_file))
+                    except Exception as e:
+                        print(f"[WARN] Falha ao remover stream {stream_file}: {e}")
+    except Exception as e:
+        print(f"[WARN] Erro ao limpar streams: {e}")
 
     session.delete(file)
     session.commit()
