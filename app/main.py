@@ -7,8 +7,11 @@ from api.routes.reports import reports_router
 from api.routes.alerts import alert_router
 from api.routes.stats import stats_router
 from fastapi_pagination import add_pagination
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="SharpShark API")
+
+origins = ["*"]
 
 app.include_router(auth_router)
 app.include_router(users_router)
@@ -17,5 +20,13 @@ app.include_router(analyses_router)
 app.include_router(alert_router)
 app.include_router(stats_router)
 app.include_router(reports_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 add_pagination(app)

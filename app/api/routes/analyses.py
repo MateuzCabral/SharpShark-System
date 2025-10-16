@@ -33,20 +33,6 @@ def get_analysis(analysis_id: str, current_user: User = Depends(check_token), se
     _ = analysis.ips
     return analysis
 
-@analyses_router.post("/", response_model=AnalysisRead, status_code=status.HTTP_201_CREATED)
-def create_analysis(payload: dict, current_user: User = Depends(check_token), session: Session = Depends(get_session)):
-    file_id = payload.get("file_id")
-    if not file_id:
-        raise HTTPException(status_code=400, detail="file_id é obrigatório")
-    file_obj = session.query(File).filter(File.id == file_id).first()
-    if not file_obj:
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
-    if file_obj.user_id != current_user.id and not current_user.is_superuser:
-        raise HTTPException(status_code=403, detail="Sem permissão para analisar este arquivo")
-
-    analysis = analysis_service.analyze_file(session, file_obj)
-    return analysis
-
 @analyses_router.get("/{analysis_id}/alerts", response_model=Page[AlertRead])
 def list_analysis_alerts(analysis_id: str, current_user: User = Depends(check_token), session: Session = Depends(get_session)):
     analysis = session.query(Analysis).filter(Analysis.id == analysis_id).first()

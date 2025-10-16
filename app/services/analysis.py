@@ -13,7 +13,7 @@ STREAMS_DIR = os.path.join(UPLOAD_DIR, "streams")
 os.makedirs(STREAMS_DIR, exist_ok=True)
 
 
-SUSPICIOUS_PAYLOAD_KEYWORDS = [b"password", b"passwd", b"login", b"admin", b"root"]
+SUSPICIOUS_PAYLOAD_KEYWORDS = [b"password", b"passwd", b"login", b"admin", b"root", b"php"]
 SUSPICIOUS_PORTS = {23: "telnet", 21: "ftp", 3389: "rdp", 22: "ssh (check if unexpected)"}
 
 def analyze_file(session: Session, file_obj: File) -> Analysis:

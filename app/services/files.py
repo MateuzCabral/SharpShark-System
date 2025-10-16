@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 from db.models import File
 from api.schemas.dependencies import validate_pcap_header, calculate_file_hash 
 import services.analysis as analysis_service
+from datetime import datetime
+import re
 
 UPLOAD_DIR = "./uploads"
 
@@ -22,15 +24,23 @@ def create_file(session: Session, file: UploadFile, user_id: str) -> File:
     if existing:
         raise HTTPException(status_code=400, detail="Arquivo já foi registrado anteriormente")
 
-    filename = os.path.basename(file.filename)
+    # Pega nome original e extensão
+    original_name, ext = os.path.splitext(os.path.basename(file.filename))
+    # Limpa o nome (remove espaços e caracteres especiais)
+    clean_name = re.sub(r"[^\w\-]", "-", original_name)
+
+    # Timestamp no formato UTC com milissegundos
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")[:-3]
+
+    # Monta o nome final
+    filename = f"{clean_name}_{timestamp}{ext}"
     file_path = os.path.join(UPLOAD_DIR, filename)
-    if os.path.exists(file_path):
-        base, ext = os.path.splitext(filename)
-        counter = 1
-        while os.path.exists(os.path.join(UPLOAD_DIR, f"{base}_{counter}{ext}")):
-            counter += 1
-        filename = f"{base}_{counter}{ext}"
+
+    counter = 1
+    while os.path.exists(file_path):
+        filename = f"{clean_name}_{timestamp}_{counter}{ext}"
         file_path = os.path.join(UPLOAD_DIR, filename)
+        counter += 1
 
     with open(file_path, "wb") as buffer:
         buffer.write(file.file.read())
@@ -64,11 +74,13 @@ def get_file_by_id(session: Session, file_id: str) -> File:
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
     return file
 
+
 def get_file_by_hash(session: Session, file_hash: str) -> File | None:
     hash_file = session.query(File).filter(File.file_hash == file_hash).first()
     if not hash_file:
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
     return hash_file
+
 
 def delete_file(session: Session, file_id: str):
     file = get_file_by_id(session, file_id)
