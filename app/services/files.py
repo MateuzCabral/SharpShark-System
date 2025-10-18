@@ -1,14 +1,14 @@
 import os
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
-from db.models import File
+from db.models import File, Analysis
 from api.schemas.dependencies import validate_pcap_header, calculate_file_hash 
 import services.analysis as analysis_service
 from datetime import datetime
 import re
 
 UPLOAD_DIR = "./uploads"
-
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 def create_file(session: Session, file: UploadFile, user_id: str) -> File:
     os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -18,21 +18,37 @@ def create_file(session: Session, file: UploadFile, user_id: str) -> File:
 
     validate_pcap_header(file)
 
+    try:
+        cur_pos = file.file.tell()
+        file.file.seek(0, os.SEEK_END)
+        size_bytes = file.file.tell()
+        file.file.seek(cur_pos or 0)
+    except Exception:
+        file.file.seek(0)
+        size_bytes = 0
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            size_bytes += len(chunk)
+            if size_bytes > MAX_UPLOAD_BYTES:
+                break
+        file.file.seek(0)
+
+    if size_bytes > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Arquivo excede o limite máximo de 100 MB")
+
     file_hash = calculate_file_hash(file)
 
     existing = session.query(File).filter(File.file_hash == file_hash).first()
     if existing:
         raise HTTPException(status_code=400, detail="Arquivo já foi registrado anteriormente")
 
-    # Pega nome original e extensão
     original_name, ext = os.path.splitext(os.path.basename(file.filename))
-    # Limpa o nome (remove espaços e caracteres especiais)
     clean_name = re.sub(r"[^\w\-]", "-", original_name)
 
-    # Timestamp no formato UTC com milissegundos
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")[:-3]
 
-    # Monta o nome final
     filename = f"{clean_name}_{timestamp}{ext}"
     file_path = os.path.join(UPLOAD_DIR, filename)
 
@@ -43,13 +59,18 @@ def create_file(session: Session, file: UploadFile, user_id: str) -> File:
         counter += 1
 
     with open(file_path, "wb") as buffer:
-        buffer.write(file.file.read())
+        file.file.seek(0)
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            buffer.write(chunk)
 
-    file_size = os.path.getsize(file_path) / 1024 / 1024  # MB
+    file_size_mb = os.path.getsize(file_path) / 1024 / 1024  # MB
     new_file = File(
         file_name=filename,
         file_path=file_path,
-        file_size=file_size,
+        file_size=file_size_mb,
         file_hash=file_hash,
         user_id=user_id,
     )
@@ -58,9 +79,18 @@ def create_file(session: Session, file: UploadFile, user_id: str) -> File:
     session.commit()
     session.refresh(new_file)
 
-    analysis_service.analyze_file(session, new_file)
+    analysis = Analysis(
+        file_id=new_file.id,
+        user_id=user_id,
+        status="pending",
+        total_packets=0,
+        total_streams=0,
+        duration=0.0
+    )
+    session.add(analysis)
+    session.commit()
+    session.refresh(analysis)
 
-    session.refresh(new_file)
     return new_file
 
 

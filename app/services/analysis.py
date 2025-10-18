@@ -16,7 +16,7 @@ os.makedirs(STREAMS_DIR, exist_ok=True)
 SUSPICIOUS_PAYLOAD_KEYWORDS = [b"password", b"passwd", b"login", b"admin", b"root", b"php"]
 SUSPICIOUS_PORTS = {23: "telnet", 21: "ftp", 3389: "rdp", 22: "ssh (check if unexpected)"}
 
-def analyze_file(session: Session, file_obj: File) -> Analysis:
+def analyze_file(session: Session, file_obj: File, analysis_id: str | None = None) -> Analysis:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -25,12 +25,24 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
     start_time = time.perf_counter()
 
     pcap_path = file_obj.file_path
-    analysis = Analysis(file_id=file_obj.id, user_id=file_obj.user_id, status="in_progress")
-    session.add(analysis)
-    session.commit()
-    session.refresh(analysis)
 
-    
+    if analysis_id:
+        analysis = session.query(Analysis).filter(Analysis.id == analysis_id).first()
+        if not analysis:
+            analysis = Analysis(file_id=file_obj.id, user_id=file_obj.user_id, status="in_progress")
+            session.add(analysis)
+            session.commit()
+            session.refresh(analysis)
+        else:
+            analysis.status = "in_progress"
+            session.add(analysis)
+            session.commit()
+    else:
+        analysis = Analysis(file_id=file_obj.id, user_id=file_obj.user_id, status="in_progress")
+        session.add(analysis)
+        session.commit()
+        session.refresh(analysis)
+
     protocol_counts: Dict[str, int] = {}
     port_counts: Dict[int, int] = {}
     ip_counts: Dict[str, int] = {}
@@ -163,7 +175,6 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
         except Exception:
             pass
 
-        # Só processa se realmente houve pacotes
         if total_packets == 0:
             raise RuntimeError("Nenhum pacote foi capturado, possivelmente arquivo inválido ou vazio.")
 
@@ -171,9 +182,8 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
         for key, meta in streams_map.items():
             packets = meta["packets"]
             if not packets:
-                continue  # pula streams vazios
+                continue  
 
-            # Verifica se há payload real
             if not any(pkt["payload"] for pkt in packets):
                 continue
 
@@ -186,7 +196,6 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
                     if payload:
                         sf.write(payload)
 
-            # Se o arquivo ficou vazio (por segurança)
             if os.path.getsize(stream_path) == 0:
                 os.remove(stream_path)
                 continue
@@ -207,7 +216,6 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
             )
             session.add(stream_model)
 
-        # Grava estatísticas e IPs
         for proto, cnt in protocol_counts.items():
             session.add(Stat(analysis_id=analysis.id, category="protocol", key=proto, count=cnt))
 
@@ -227,7 +235,6 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
                 organization="unknown"
             ))
 
-
         end_time = time.perf_counter()
        
         analysis.status = "completed"
@@ -242,15 +249,20 @@ def analyze_file(session: Session, file_obj: File) -> Analysis:
 
     except Exception as e:
         tb = traceback.format_exc()
-        analysis.status = "failed"
-        session.add(analysis)
-        session.commit()
+        try:
+            analysis.status = "failed"
+            session.add(analysis)
+            session.commit()
+        except Exception:
+            pass
 
-        # Remove arquivos vazios caso a análise tenha falhado
-        for f in os.listdir(STREAMS_DIR):
-            path = os.path.join(STREAMS_DIR, f)
-            if os.path.isfile(path) and os.path.getsize(path) == 0:
-                os.remove(path)
+        try:
+            for f in os.listdir(STREAMS_DIR):
+                path = os.path.join(STREAMS_DIR, f)
+                if os.path.isfile(path) and os.path.getsize(path) == 0:
+                    os.remove(path)
+        except Exception:
+            pass
 
         fail_alert = Alert(
             analysis_id=analysis.id,

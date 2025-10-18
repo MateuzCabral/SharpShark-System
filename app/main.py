@@ -1,3 +1,4 @@
+# app/main.py
 from fastapi import FastAPI
 from api.routes.auth import auth_router
 from api.routes.users import users_router
@@ -30,3 +31,22 @@ app.add_middleware(
 )
 
 add_pagination(app)
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        from services import worker
+        await worker.launch_background_worker(app)
+    except Exception as e:
+        import logging
+        logging.getLogger("sharpshark").exception(f"Failed to start worker: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        from services import worker
+        await worker.stop_background_worker(app)
+    except Exception:
+        import logging
+        logging.getLogger("sharpshark").exception("Failed to stop worker cleanly.")
