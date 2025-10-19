@@ -1,14 +1,23 @@
 from datetime import timedelta
-from fastapi import HTTPException, status
+from fastapi import HTTPException, status, Request
 from sqlalchemy.orm import Session
 from db.models import User
 from core.security import argon_context, create_access_token, EXPIRE_MINUTES
+from core.rate_limiter import login_rate_limiter
 
-def find_user_by_name(name: str, session: Session) -> User | None:
+async def find_user_by_name(name: str, session: Session) -> User | None:
     return session.query(User).filter(User.name == name).first()
 
-def verify_user_credentials(name: str, password: str, session: Session) -> User:
-    user = find_user_by_name(name, session)
+async def verify_user_credentials(name: str, password: str, session: Session, request: Request) -> User:
+    client_ip = request.client.host
+    allowed = await login_rate_limiter.is_allowed(client_ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Muitas tentativas de login. Tente novamente em alguns minutos."
+        )
+
+    user = await find_user_by_name(name, session)
 
     if not user or not user.is_active or not argon_context.verify(password, user.password):
         raise HTTPException(

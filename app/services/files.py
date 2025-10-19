@@ -1,16 +1,23 @@
 import os
+import re
+from datetime import datetime
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 from db.models import File, Analysis
 from api.schemas.dependencies import validate_pcap_header, calculate_file_hash 
-import services.analysis as analysis_service
-from datetime import datetime
-import re
+from core.rate_limiter import upload_rate_limiter
 
 UPLOAD_DIR = "./uploads"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
-def create_file(session: Session, file: UploadFile, user_id: str) -> File:
+async def create_file(session: Session, file: UploadFile, user_id: str) -> File:
+    allowed = await upload_rate_limiter.is_allowed(user_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Limite de uploads atingido. Tente novamente mais tarde."
+        )
+
     os.makedirs(UPLOAD_DIR, exist_ok=True)
 
     if not file.filename.endswith((".pcapng", ".pcap")):
@@ -46,9 +53,7 @@ def create_file(session: Session, file: UploadFile, user_id: str) -> File:
 
     original_name, ext = os.path.splitext(os.path.basename(file.filename))
     clean_name = re.sub(r"[^\w\-]", "-", original_name)
-
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")[:-3]
-
     filename = f"{clean_name}_{timestamp}{ext}"
     file_path = os.path.join(UPLOAD_DIR, filename)
 
@@ -66,7 +71,7 @@ def create_file(session: Session, file: UploadFile, user_id: str) -> File:
                 break
             buffer.write(chunk)
 
-    file_size_mb = os.path.getsize(file_path) / 1024 / 1024  # MB
+    file_size_mb = os.path.getsize(file_path) / 1024 / 1024
     new_file = File(
         file_name=filename,
         file_path=file_path,
@@ -114,7 +119,6 @@ def get_file_by_hash(session: Session, file_hash: str) -> File | None:
 
 def delete_file(session: Session, file_id: str):
     file = get_file_by_id(session, file_id)
-
     if not file:
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
 
@@ -127,8 +131,10 @@ def delete_file(session: Session, file_id: str):
     try:
         for analysis in file.analysis:
             streams_dir = os.path.join("uploads", "streams")
+            if not os.path.exists(streams_dir):
+                continue
             for stream_file in os.listdir(streams_dir):
-                if stream_file.startswith(analysis.id):
+                if stream_file.startswith(str(analysis.id)):
                     try:
                         os.remove(os.path.join(streams_dir, stream_file))
                     except Exception as e:

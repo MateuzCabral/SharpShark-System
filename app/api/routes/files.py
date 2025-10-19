@@ -10,13 +10,12 @@ import services.files as file_service
 files_router = APIRouter(prefix="/files", tags=["files"])
 
 @files_router.post("/upload", response_model=FileRead, status_code=status.HTTP_201_CREATED)
-def upload_file(
+async def upload_file(
     file: UploadFile,
     current_user: User = Depends(require_active_user),
     session: Session = Depends(get_session)
 ):
-    return file_service.create_file(session, file, current_user.id)
-
+    return await file_service.create_file(session, file, current_user.id)
 
 @files_router.get("/", response_model=Page[FileRead])
 def get_all_files(
@@ -25,7 +24,6 @@ def get_all_files(
 ):
     query = file_service.get_files_query(session)
     return paginate(query)
-
 
 @files_router.get("/{file_id}", response_model=FileRead)
 def get_file(file_id: str, current_user: User = Depends(require_active_user), session: Session = Depends(get_session)):
