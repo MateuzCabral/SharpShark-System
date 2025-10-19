@@ -1,6 +1,7 @@
 import time
 import asyncio
 from collections import defaultdict
+from core.config import LOGIN_RATE_LIMIT, LOGIN_RATE_PERIOD, UPLOAD_RATE_LIMIT, UPLOAD_RATE_PERIOD
 
 class RateLimiter:
     def __init__(self, limit: int, period: int):
@@ -31,7 +32,6 @@ class RateLimiter:
             ]
             for key in to_delete:
                 del self.attempts[key]
-
-# Instâncias globais
-login_rate_limiter = RateLimiter(limit=5, period=600)      # 5 tentativas / 10 min
-upload_rate_limiter = RateLimiter(limit=10, period=3600)   # 10 uploads / hora
+                
+login_rate_limiter = RateLimiter(limit=LOGIN_RATE_LIMIT, period=LOGIN_RATE_PERIOD)
+upload_rate_limiter = RateLimiter(limit=UPLOAD_RATE_LIMIT, period=UPLOAD_RATE_PERIOD) 

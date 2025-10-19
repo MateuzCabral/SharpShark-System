@@ -8,8 +8,8 @@ from jose import jwt
 load_dotenv()
 
 SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM")
-EXPIRE_MINUTES = int(os.getenv("EXPIRE_MINUTES"))
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+EXPIRE_MINUTES = int(os.getenv("EXPIRE_MINUTES", 1440))
 
 argon_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_schema = OAuth2PasswordBearer(tokenUrl="/auth/login-form")

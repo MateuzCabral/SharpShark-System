@@ -1,10 +1,7 @@
 import asyncio
-import os
 import traceback
 from sqlalchemy.orm import sessionmaker
 from db.models import db, Analysis, File
-from sqlalchemy import select, update
-from datetime import datetime
 import logging
 
 logger = logging.getLogger("sharpshark.worker")

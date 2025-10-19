@@ -7,8 +7,9 @@ from db.models import Analysis, Stream, Alert, Stat, IpRecord, File
 from datetime import datetime, timezone
 import pyshark
 import time
+from core.config import UPLOAD_DIRECTORY
 
-UPLOAD_DIR = "./uploads"
+UPLOAD_DIR = UPLOAD_DIRECTORY
 STREAMS_DIR = os.path.join(UPLOAD_DIR, "streams")
 os.makedirs(STREAMS_DIR, exist_ok=True)
 

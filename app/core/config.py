@@ -1,0 +1,14 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Limites de segurança
+LOGIN_RATE_LIMIT = int(os.getenv("LOGIN_RATE_LIMIT", 5))
+LOGIN_RATE_PERIOD = int(os.getenv("LOGIN_RATE_PERIOD", 600))
+UPLOAD_RATE_LIMIT = int(os.getenv("UPLOAD_RATE_LIMIT", 10))
+UPLOAD_RATE_PERIOD = int(os.getenv("UPLOAD_RATE_PERIOD", 3600))
+
+# Diretórios e outros
+UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY", "./uploads")
+

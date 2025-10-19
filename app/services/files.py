@@ -6,8 +6,9 @@ from sqlalchemy.orm import Session
 from db.models import File, Analysis
 from api.schemas.dependencies import validate_pcap_header, calculate_file_hash 
 from core.rate_limiter import upload_rate_limiter
+from core.config import UPLOAD_DIRECTORY
 
-UPLOAD_DIR = "./uploads"
+UPLOAD_DIR = UPLOAD_DIRECTORY
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 async def create_file(session: Session, file: UploadFile, user_id: str) -> File:
