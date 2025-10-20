@@ -11,4 +11,4 @@ UPLOAD_RATE_PERIOD = int(os.getenv("UPLOAD_RATE_PERIOD", 3600))
 
 # Diretórios e outros
 UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY", "./uploads")
-
+INGEST_BASE_DIRECTORY = os.path.abspath(os.getenv("INGEST_BASE_DIRECTORY", "./uploads/ingest"))

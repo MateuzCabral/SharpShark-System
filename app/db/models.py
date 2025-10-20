@@ -162,3 +162,13 @@ class IpRecord(Base):
         self.region = region
         self.country = country
         self.organization = organization
+
+class Setting(Base):
+    __tablename__ = "settings"
+
+    key = Column(String, primary_key=True, unique=True, nullable=False)
+    value = Column(String, nullable=True)
+
+    def __init__(self, key: str, value: str | None = None):
+        self.key = key
+        self.value = value
