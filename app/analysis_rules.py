@@ -25,7 +25,6 @@ class RulesEngine:
 
         alerts.extend(self._rule_suspicious_ports(info))
         alerts.extend(self._rule_detect_port_scan(info))
-        alerts.extend(self._rule_detect_shellshock(info))
         alerts.extend(self._rule_detect_sqli(info))
         alerts.extend(self._rule_detect_xss(info))
         
