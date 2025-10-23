@@ -7,6 +7,7 @@ from api.routes.reports import reports_router
 from api.routes.alerts import alert_router
 from api.routes.stats import stats_router
 from api.routes.settings import settings_router
+from api.routes.custom_rules import custom_rules_router
 from fastapi_pagination import add_pagination
 from fastapi.middleware.cors import CORSMiddleware
 import logging
@@ -33,6 +34,7 @@ app.include_router(alert_router)
 app.include_router(stats_router)
 app.include_router(reports_router)
 app.include_router(settings_router)
+app.include_router(custom_rules_router)
 
 app.add_middleware(
     CORSMiddleware,

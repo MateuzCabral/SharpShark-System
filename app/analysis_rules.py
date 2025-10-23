@@ -6,27 +6,37 @@ from urllib.parse import unquote_plus
 PORT_SCAN_THRESHOLD = 10 # Alerta se um IP tentar aceder a mais de 10 portas num único host
 
 class RulesEngine:
-    def __init__(self, analysis_id: str):
+    def __init__(self, analysis_id: str, custom_payload_rules: list = [], custom_port_rules: list = []):
         self.analysis_id = analysis_id
         self.port_scan_tracker = defaultdict(lambda: defaultdict(set))
+        self.custom_port_tracker = set()
+        self.custom_payload_tracker = set()
+        
+        self.custom_payload_rules = custom_payload_rules
+        
+        self.custom_port_rules_map = {}
+        for rule in custom_port_rules:
+            try:
+                self.custom_port_rules_map[int(rule.value)] = rule
+            except:
+                pass 
 
     def process_packet(self, pkt) -> list[Alert]:
         alerts = []
         
         info = self._extract_packet_info(pkt)
 
-        if info['dst_port'] in [80, 443, 8080]:
+        if info['dst_port'] in [80, 443, 8080] or info['src_port'] in [80, 443, 8080]:
             try:
-                info['decoded_payload'] = unquote_plus(info['payload'].decode('utf-8', errors='ignore'))
+                info['decoded_payload'] = unquote_plus(info['payload'].decode('utf-8', errors='ignore')).lower()
             except Exception:
-                info['decoded_payload'] = info['payload'].decode('utf-8', errors='ignore')
+                info['decoded_payload'] = info['payload'].decode('utf-8', errors='ignore').lower()
         else:
             info['decoded_payload'] = None
 
-        alerts.extend(self._rule_suspicious_ports(info))
-        alerts.extend(self._rule_detect_port_scan(info))
-        alerts.extend(self._rule_detect_sqli(info))
-        alerts.extend(self._rule_detect_xss(info))
+        alerts.extend(self._rule_detect_custom_port(info))
+        alerts.extend(self._rule_detect_custom_payload(info))
+        alerts.extend(self._rule_detect_port_scan(info, pkt))
         
         return alerts
 
@@ -56,30 +66,65 @@ class RulesEngine:
                 info['payload'] = bytes.fromhex(pkt.udp.payload.replace(":", ""))
 
         return info
-
-    # --- REGRA 1: Portas Suspeitas ---
-    def _rule_suspicious_ports(self, info: dict) -> list[Alert]:
+    
+    def _rule_detect_custom_port(self, info: dict) -> list[Alert]:
         alerts = []
-        port_map = {
-            21: "FTP", 
-            23: "Telnet", 
-            3389: "RDP",
-            22: "SSH" 
-        }
+        dst_port = info.get('dst_port')
         
-        if info['dst_port'] in port_map:
+        rule = self.custom_port_rules_map.get(dst_port)
+        if not rule:
+            return alerts
+            
+        tracker_key = (info['src_ip'], dst_port)
+        if tracker_key not in self.custom_port_tracker:
             alerts.append(Alert(
-                analysis_id=self.analysis_id, alert_type="suspicious_protocol_use",
-                severity="high", src_ip=info['src_ip'], dst_ip=info['dst_ip'],
-                port=info['dst_port'], protocol=info['proto'],
-                evidence=f"Uso de protocolo potencialmente inseguro ou não monitorizado detetado: {port_map[info['dst_port']]}"
+                analysis_id=self.analysis_id, 
+                alert_type=rule.alert_type,
+                severity=rule.severity, 
+                src_ip=info['src_ip'], 
+                dst_ip=info['dst_ip'],
+                port=dst_port, 
+                protocol=info['proto'],
+                evidence=f"Detetada conexão à porta customizada {dst_port} (Regra: {rule.name})"
             ))
+            self.custom_port_tracker.add(tracker_key)
+            
         return alerts
 
-    # --- REGRA 2: Deteção de Port Scan (Threshold) ---
-    def _rule_detect_port_scan(self, info: dict) -> list[Alert]:
+    def _rule_detect_custom_payload(self, info: dict) -> list[Alert]:
+        alerts = []
+        if not info['decoded_payload'] or not self.custom_payload_rules:
+            return alerts
+            
+        for rule in self.custom_payload_rules:
+            if rule.value.lower() in info['decoded_payload']:
+                
+                tracker_key = (info['src_ip'], info['dst_ip'], rule.id)
+                if tracker_key not in self.custom_payload_tracker:
+                    alerts.append(Alert(
+                        analysis_id=self.analysis_id,
+                        alert_type=rule.alert_type,
+                        severity=rule.severity,
+                        src_ip=info['src_ip'], dst_ip=info['dst_ip'],
+                        port=info['dst_port'], protocol=info['proto'],
+                        evidence=f"Detetada assinatura de payload customizado (Regra: {rule.name})"
+                    ))
+                    self.custom_payload_tracker.add(tracker_key)
+        return alerts
+
+    def _rule_detect_port_scan(self, info: dict, pkt) -> list[Alert]:
         alerts = []
         if info['proto'] != 'tcp' or not info['src_ip'] or not info['dst_ip']:
+            return alerts
+            
+        is_syn_packet = False
+        try:
+            if pkt.tcp.flags_syn == '1' and pkt.tcp.flags_ack == '0':
+                is_syn_packet = True
+        except AttributeError:
+            return alerts 
+
+        if not is_syn_packet:
             return alerts
             
         tracker = self.port_scan_tracker[info['src_ip']][info['dst_ip']]
@@ -93,57 +138,7 @@ class RulesEngine:
             alerts.append(Alert(
                 analysis_id=self.analysis_id, alert_type="port_scan_detected",
                 severity="high", src_ip=info['src_ip'], dst_ip=info['dst_ip'],
-                evidence=f"IP de origem {info['src_ip']} tentou aceder a {len(tracker)} portas no destino {info['dst_ip']}."
+                evidence=f"IP de origem {info['src_ip']} enviou pacotes SYN para {len(tracker)} portas no destino {info['dst_ip']}."
             ))
-            tracker.add('alerted') # Marca para não alertar novamente
-        return alerts
-
-    # --- REGRA 3: Deteção de SQL Injection (Assinatura com Regex) ---
-    def _rule_detect_sqli(self, info: dict) -> list[Alert]:
-        alerts = []
-        if not info['decoded_payload']:
-            return alerts
-
-        # Padrões Regex para SQLi comuns (case-insensitive)
-        sqli_patterns = [
-            r"(\s*')\s*OR\s*(\d+)\s*=\s*(\d+)", # ' OR 1=1
-            r"\bUNION\s+SELECT\b",
-            r"(\s*--)|(\s*/\*.*\*/)" # Comentários SQL
-        ]
-        
-        for pattern in sqli_patterns:
-            if re.search(pattern, info['decoded_payload'], re.IGNORECASE):
-                alerts.append(Alert(
-                    analysis_id=self.analysis_id, alert_type="sql_injection_attempt",
-                    severity="critical", src_ip=info['src_ip'], dst_ip=info['dst_ip'],
-                    port=info['dst_port'], protocol=info['proto'],
-                    evidence="Detetada possível tentativa de SQL Injection no payload HTTP."
-                ))
-                return alerts # Retorna no primeiro match
-        return alerts
-
-    # --- REGRA 4: Deteção de Cross-Site Scripting (XSS) ---
-    def _rule_detect_xss(self, info: dict) -> list[Alert]:
-        alerts = []
-        if not info['decoded_payload']:
-            return alerts
-
-        # Padrões Regex para XSS comuns (case-insensitive)
-        xss_patterns = [
-            r"<script.*?>.*?</script>",
-            r"\balert\s*\(",
-            r"\bonerror\s*=",
-            r"\bonload\s*=",
-            r"javascript:"
-        ]
-
-        for pattern in xss_patterns:
-            if re.search(pattern, info['decoded_payload'], re.IGNORECASE):
-                alerts.append(Alert(
-                    analysis_id=self.analysis_id, alert_type="xss_attempt",
-                    severity="high", src_ip=info['src_ip'], dst_ip=info['dst_ip'],
-                    port=info['dst_port'], protocol=info['proto'],
-                    evidence="Detetada possível tentativa de Cross-Site Scripting (XSS) no payload HTTP."
-                ))
-                return alerts # Retorna no primeiro match
+            tracker.add('alerted')
         return alerts
