@@ -142,11 +142,6 @@ class IpRecord(Base):
     ip = Column(String, nullable=False)
     role = Column(String, nullable=False) 
     count = Column(Integer, default=0)
-    hostname = Column(String, nullable=False, default="unknown")
-    city = Column(String, nullable=False, default="unknown")
-    region = Column(String, nullable=False, default="unknown")
-    country = Column(String, nullable=False, default="unknown")
-    organization = Column(String, nullable=False, default="unknown")
     analysis = relationship("Analysis", back_populates="ips")
 
     def __init__(self, analysis_id: str, ip: str, role: str, count: int = 0, hostname: str = "unknown", city: str = "unknown", region: str = "unknown", country: str = "unknown", organization: str = "unknown"):
@@ -154,11 +149,6 @@ class IpRecord(Base):
         self.ip = ip
         self.role = role
         self.count = count
-        self.hostname = hostname
-        self.city = city
-        self.region = region
-        self.country = country
-        self.organization = organization
 
 class Setting(Base):
     __tablename__ = "settings"

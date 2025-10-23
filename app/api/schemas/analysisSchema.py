@@ -4,7 +4,7 @@ from datetime import datetime
 
 class AlertRead(BaseModel):
     id: str
-    stream_id: Optional[str] = None
+    stream_id: Optional[str] = None 
     alert_type: str
     severity: str
     src_ip: Optional[str]
@@ -21,7 +21,7 @@ class StreamRead(BaseModel):
     stream_number: int
     content_path: str
     preview: Optional[str]
-    alerts: Optional[List[AlertRead]] = []
+    alerts: Optional[List[AlertRead]] = [] 
 
     class Config:
         from_attributes = True
@@ -40,11 +40,6 @@ class IpRecordRead(BaseModel):
     ip: str
     role: str
     count: int
-    hostname: str
-    city: str
-    region: str
-    country: str
-    organization: str
 
     class Config:
         from_attributes = True
@@ -58,9 +53,9 @@ class AnalysisRead(BaseModel):
     duration: float
     analyzed_at: Optional[datetime]
     streams: Optional[List[StreamRead]] = [] 
-    alerts: Optional[List[AlertRead]] = []
-    stats: Optional[List[StatRead]] = []
-    ips: Optional[List[IpRecordRead]] = []
+    alerts: Optional[List[AlertRead]] = [] 
+    stats: Optional[List[StatRead]] = [] 
+    ips: Optional[List[IpRecordRead]] = [] 
 
     class Config:
         from_attributes = True

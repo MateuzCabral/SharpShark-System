@@ -55,9 +55,7 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
     if not analysis:
         raise RuntimeError(f"Análise {analysis_id} não encontrada no início de analyze_file.")
 
-    logger.info("Carregando regras globais de admin...")
     all_rules = session.query(CustomRule).all()
-    
     payload_rules = [r for r in all_rules if r.rule_type == 'payload']
     port_rules = [r for r in all_rules if r.rule_type == 'port']
     logger.info(f"Regras carregadas: {len(payload_rules)} de payload, {len(port_rules)} de porta.")
@@ -70,7 +68,10 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
     
     protocol_counts: Dict[str, int] = {}
     port_counts: Dict[int, int] = {}
-    ip_counts: Dict[str, int] = {}
+    
+    src_ip_counts: Dict[str, int] = {}
+    dst_ip_counts: Dict[str, int] = {}
+    
     streams_map: Dict[str, Dict] = {} 
     total_packets = 0
 
@@ -83,11 +84,13 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
             
             proto = next((lay.layer_name for lay in pkt.layers), "unknown")
             protocol_counts[proto] = protocol_counts.get(proto, 0) + 1
-
+            
             src, dst = (pkt.ip.src, pkt.ip.dst) if hasattr(pkt, 'ip') else \
                          (pkt.ipv6.src, pkt.ipv6.dst) if hasattr(pkt, 'ipv6') else (None, None)
-            if src: ip_counts[src] = ip_counts.get(src, 0) + 1
-            if dst: ip_counts[dst] = ip_counts.get(dst, 0) + 1
+            
+            if src: src_ip_counts[src] = src_ip_counts.get(src, 0) + 1 
+            if dst: dst_ip_counts[dst] = dst_ip_counts.get(dst, 0) + 1
+            
             sport, dport = (int(pkt.tcp.srcport), int(pkt.tcp.dstport)) if hasattr(pkt, 'tcp') else \
                              (int(pkt.udp.srcport), int(pkt.udp.dstport)) if hasattr(pkt, 'udp') else (None, None)
             if sport: port_counts[sport] = port_counts.get(sport, 0) + 1
@@ -120,7 +123,7 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
         session.add(fail_alert)
         session.commit()
         raise
-    
+
     stream_count = 0
     for meta in streams_map.values():
         if meta.get("is_encrypted", False):
@@ -128,31 +131,26 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
         full_payload = b"".join(p["payload"] for p in meta["packets"] if p.get("payload"))
         if not full_payload or not is_payload_readable(full_payload):
             continue
-        
         stream_count += 1
         stream_filename = f"{analysis.id}_stream_{stream_count}.bin"
         stream_path = os.path.join(STREAMS_DIR, stream_filename)
         with open(stream_path, "wb") as sf:
             sf.write(full_payload)
-        
         try:
             preview = full_payload[:200].decode('utf-8', errors='ignore')
         except:
             preview = full_payload[:200].hex()
-            
         new_stream = Stream(
             analysis_id=analysis.id, stream_number=meta["stream_number"],
             content_path=stream_path, preview=preview
         )
         session.add(new_stream)
-
         try:
             session.flush() 
         except Exception as e:
             logger.error(f"Erro ao 'flushar' stream: {e}")
             session.rollback()
             continue
-
         if "pending_alerts" in meta:
             for alert in meta["pending_alerts"]:
                 alert.stream_id = new_stream.id 
@@ -162,8 +160,21 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
         session.add(Stat(analysis_id=analysis.id, category="protocol", key=proto, count=cnt))
     for port, cnt in port_counts.items():
         session.add(Stat(analysis_id=analysis.id, category="port", key=str(port), count=cnt))
-    for ip, cnt in ip_counts.items():
-        session.add(IpRecord(analysis_id=analysis.id, ip=ip, role="unknown", count=cnt))
+
+    for ip, cnt in src_ip_counts.items():
+        session.add(IpRecord(
+            analysis_id=analysis.id, 
+            ip=ip, 
+            role="SRC", 
+            count=cnt
+        ))
+    for ip, cnt in dst_ip_counts.items():
+        session.add(IpRecord(
+            analysis_id=analysis.id, 
+            ip=ip, 
+            role="DST", 
+            count=cnt
+        ))
 
     end_time = time.perf_counter()
     analysis.status = "completed"
