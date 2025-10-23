@@ -84,6 +84,7 @@ class Stream(Base):
     content_path = Column(String, nullable=False)  # pode guardar path do payload salvo
 
     analysis = relationship("Analysis", back_populates="streams")
+    alerts = relationship("Alert", back_populates="stream")
 
     def __init__(self, analysis_id: str, stream_number: int, content_path: str, preview: str = ""):
         self.analysis_id = analysis_id
@@ -97,6 +98,7 @@ class Alert(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     analysis_id = Column(String, ForeignKey("analysis.id"), nullable=False)
+    stream_id = Column(String, ForeignKey("streams.id"), nullable=True)
     alert_type = Column(String, nullable=False)
     severity = Column(String, nullable=False)  # low | medium | high | critical
     src_ip = Column(String)
@@ -106,6 +108,7 @@ class Alert(Base):
     evidence = Column(String)
 
     analysis = relationship("Analysis", back_populates="alerts")
+    stream = relationship("Stream", back_populates="alerts")
 
     def __init__(self, analysis_id: str, alert_type: str, severity: str, src_ip: str = "", dst_ip: str = "", port: int = None, protocol: str = "", evidence: str = ""):
         self.analysis_id = analysis_id

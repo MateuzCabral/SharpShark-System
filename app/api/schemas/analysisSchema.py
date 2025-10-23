@@ -2,17 +2,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 
-class StreamRead(BaseModel):
-    id: str
-    stream_number: int
-    content_path: str
-    preview: Optional[str]
-
-    class Config:
-        from_attributes = True
-
 class AlertRead(BaseModel):
     id: str
+    stream_id: Optional[str] = None
     alert_type: str
     severity: str
     src_ip: Optional[str]
@@ -20,6 +12,16 @@ class AlertRead(BaseModel):
     port: Optional[int]
     protocol: Optional[str]
     evidence: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+class StreamRead(BaseModel):
+    id: str
+    stream_number: int
+    content_path: str
+    preview: Optional[str]
+    alerts: Optional[List[AlertRead]] = []
 
     class Config:
         from_attributes = True
@@ -55,7 +57,7 @@ class AnalysisRead(BaseModel):
     total_streams: int
     duration: float
     analyzed_at: Optional[datetime]
-    streams: Optional[List[StreamRead]] = []
+    streams: Optional[List[StreamRead]] = [] 
     alerts: Optional[List[AlertRead]] = []
     stats: Optional[List[StatRead]] = []
     ips: Optional[List[IpRecordRead]] = []
