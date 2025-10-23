@@ -12,31 +12,40 @@ from typing import List, Optional
 
 logger = logging.getLogger("sharpshark.settings")
 
+# Chaves usadas na tabela 'settings' (key-value)
 INGEST_FOLDER_KEY = "INGEST_FOLDER"
 INGEST_USER_ID_KEY = "INGEST_USER_ID"
 INGEST_PROJECT_NAME_KEY = "INGEST_PROJECT_NAME"
 
 def get_current_settings(session: Session) -> SettingsResponse:
+    """
+    Busca as configurações atuais de ingestão, formatando-as
+    em um 'SettingsResponse' (que inclui o nome do usuário).
+    """
     logger.debug("Buscando configurações atuais de ingestão...")
     try:
+        # Busca os valores brutos
         folder = get_setting(session, INGEST_FOLDER_KEY)
         project_name = get_setting(session, INGEST_PROJECT_NAME_KEY)
         user_id = get_setting(session, INGEST_USER_ID_KEY)
         user_name = None
 
+        # Se um user_id estiver definido, busca o nome dele
         if user_id:
             try:
                 user = get_user_by_id(session, user_id)
                 if user: user_name = user.name
             except HTTPException as e:
+                # Se o usuário foi deletado, mas a config ainda existe
                 if e.status_code == 404:
                     logger.warning(f"Usuário de ingestão (ID: {user_id}) não encontrado no DB. Retornando nome nulo.")
                     user_name = None
                 else:
                      logger.error(f"Erro inesperado ao buscar usuário de ingestão {user_id}: {e.detail}")
             except Exception as e_user:
-                logger.exception(f"Erro GERAL ao buscar usuário de ingestão {user_id}: {e_user}")
+                 logger.exception(f"Erro GERAL ao buscar usuário de ingestão {user_id}: {e_user}")
 
+        # Monta o objeto de resposta
         response = SettingsResponse(
             ingest_project_name=project_name, ingest_folder=folder,
             ingest_user_id=user_id, ingest_user_name=user_name
@@ -52,22 +61,31 @@ def get_current_settings(session: Session) -> SettingsResponse:
          raise HTTPException(status_code=500, detail="Erro interno inesperado ao buscar configurações.")
 
 def get_setting(session: Session, key: str) -> Optional[str]:
+    """ Helper: Busca um valor de configuração pela chave. """
     setting = session.query(Setting).filter(Setting.key == key).first()
     return setting.value if setting else None
 
 def set_setting(session: Session, key: str, value: Optional[str]) -> Setting:
+    """ Helper: Define (cria ou atualiza) um valor de configuração. """
     setting = session.query(Setting).filter(Setting.key == key).first()
     if setting:
+        # Atualiza
         setting.value = value
     else:
+        # Cria
         setting = Setting(key=key, value=value)
         session.add(setting)
     return setting
 
 def get_all_settings(session: Session) -> List[Setting]:
+    """ Busca todas as configurações (não usado atualmente). """
     return session.query(Setting).all()
 
 def update_ingest_settings(session: Session, project_name_input: Optional[str], current_user_id: str) -> SettingsResponse:
+    """
+    Atualiza as configurações de ingestão (Watchdog).
+    Esta é a lógica principal do endpoint PUT /settings.
+    """
     project_name = project_name_input.strip() if project_name_input else ""
     logger.info(f"Admin {current_user_id}: Atualizando configurações de ingestão. Nome do projeto: '{project_name}'")
 
@@ -75,33 +93,41 @@ def update_ingest_settings(session: Session, project_name_input: Optional[str], 
     user_id_to_save = ""
     project_name_to_save = ""
 
+    # Se um nome de projeto foi fornecido...
     if project_name:
+        # 1. Sanitiza o nome para ser seguro para o sistema de arquivos
         safe_name = re.sub(r'[^\w\-.]', '_', project_name)
         if not safe_name:
             logger.warning(f"Admin {current_user_id}: Nome de projeto inválido após sanitização: '{project_name}' -> '{safe_name}'")
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome do projeto inválido após sanitização.")
 
+        # 2. Define o caminho completo da pasta
         full_path = os.path.join(INGEST_BASE_DIRECTORY, safe_name)
         logger.info(f"Admin {current_user_id}: Caminho de ingestão definido como: {full_path}")
 
+        # 3. Tenta criar o diretório (validação importante!)
         try:
             os.makedirs(full_path, exist_ok=True)
             if not os.path.isdir(full_path):
                  raise OSError(f"Caminho existe mas não é um diretório: {full_path}")
             logger.info(f"Admin {current_user_id}: Diretório de ingestão acessível/criado: {full_path}")
         except OSError as e:
+            # Se não conseguir criar (ex: permissão negada), falha a requisição
             logger.error(f"Admin {current_user_id}: Falha OSError ao criar/acessar diretório {full_path}: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Não foi possível criar ou acessar o diretório de ingestão no servidor: {e}"
             )
 
+        # 4. Define os valores a serem salvos no DB
         folder_path_to_save = full_path
         project_name_to_save = safe_name
-        user_id_to_save = current_user_id
+        user_id_to_save = current_user_id # Atribui ao admin que configurou
     else:
+        # Se o nome do projeto for vazio, limpa as configurações
         logger.info(f"Admin {current_user_id}: Limpando configurações de ingestão (projeto vazio).")
 
+    # 5. Salva as configurações no DB (como transação)
     try:
         set_setting(session, INGEST_FOLDER_KEY, folder_path_to_save)
         set_setting(session, INGEST_USER_ID_KEY, user_id_to_save)
@@ -120,4 +146,5 @@ def update_ingest_settings(session: Session, project_name_input: Optional[str], 
         logger.exception(f"Admin {current_user_id}: Erro inesperado ao salvar configurações: {e}")
         raise HTTPException(status_code=500, detail="Erro interno inesperado ao salvar configurações.")
 
+    # Retorna o novo estado das configurações
     return get_current_settings(session)
