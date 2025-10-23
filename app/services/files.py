@@ -17,85 +17,95 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 logger = logging.getLogger("sharpshark.files")
 
 async def create_file(session: Session, file: UploadFile, user_id: str, request: Request) -> File:
-    allowed = await upload_rate_limiter.is_allowed(user_id)
-    if not allowed:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Limite de uploads atingido.")
+    client_ip = request.client.host if request.client else "IP Desconhecido"
+    logger.info(f"Recebida tentativa de upload de user {user_id} (IP: {client_ip})")
 
+    if not await upload_rate_limiter.is_allowed(user_id):
+        logger.warning(f"User {user_id} (IP: {client_ip}) atingiu limite de upload.")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Limite de uploads atingido. Tente novamente mais tarde."
+        )
     try:
         new_file, analysis = await asyncio.to_thread(_create_file_sync, session, file, user_id)
+
         process_pool = request.app.state.process_pool
         process_pool.submit(run_analysis_task, analysis_id=analysis.id, file_id=new_file.id)
-        logger.info(f"Análise {analysis.id} (Arquivo {new_file.id}) submetida ao Process Pool via API.")
+        logger.info(f"Análise {analysis.id} (Arquivo {new_file.id}) submetida ao Process Pool via API (User: {user_id}).")
 
         return new_file
     except HTTPException as e:
+        if 400 <= e.status_code < 500:
+            logger.info(f"Falha no upload para user {user_id} (IP: {client_ip}): {e.status_code} - {e.detail}")
+        else:
+            logger.error(f"Erro HTTP {e.status_code} inesperado durante upload (User: {user_id}, IP: {client_ip}): {e.detail}")
         raise e
     except Exception as e:
-        logger.exception(f"Erro inesperado em create_file (antes ou depois de _create_file_sync): {e}")
+        logger.exception(f"Erro GERAL inesperado em create_file (User: {user_id}, IP: {client_ip}): {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erro interno inesperado ao iniciar processamento do ficheiro.")
 
 def _create_file_sync(session: Session, file: UploadFile, user_id: str) -> tuple[File, Analysis]:
-    try:
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
+    filename_log = file.filename or "NomeDesconhecido"
+    logger.info(f"User {user_id}: Iniciando _create_file_sync para '{filename_log}'")
+
+    try: os.makedirs(UPLOAD_DIR, exist_ok=True)
     except OSError as e:
-        logger.error(f"Falha crítica ao criar diretório de upload {UPLOAD_DIR}: {e}")
+        logger.error(f"User {user_id}: Falha crítica ao acessar/criar diretório de upload {UPLOAD_DIR}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro interno ao acessar armazenamento.")
 
     if not file.filename or not file.filename.endswith((".pcapng", ".pcap")):
+        logger.info(f"User {user_id}: Upload rejeitado - Nome/extensão inválida '{filename_log}'")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome de ficheiro inválido ou extensão não permitida (.pcapng, .pcap).")
-
-    try:
-        validate_pcap_header(file)
-    except HTTPException:
-        raise
+    try: validate_pcap_header(file)
+    except HTTPException as e:
+        logger.info(f"User {user_id}: Upload rejeitado - Header inválido '{filename_log}' - {e.detail}")
+        raise e
     except Exception as e:
-        logger.warning(f"Erro inesperado validando header do ficheiro {file.filename}: {e}")
+        logger.warning(f"User {user_id}: Erro inesperado validando header '{filename_log}': {e}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Não foi possível ler o cabeçalho do ficheiro.")
-
     try:
         size_bytes = file.file.seek(0, 2)
         file.file.seek(0)
     except (OSError, AttributeError, ValueError) as e:
-        logger.warning(f"Erro ao determinar tamanho do ficheiro {file.filename}: {e}")
+        logger.warning(f"User {user_id}: Erro ao determinar tamanho '{filename_log}': {e}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Não foi possível determinar o tamanho do ficheiro.")
-
     if size_bytes > MAX_UPLOAD_BYTES:
+        logger.info(f"User {user_id}: Upload rejeitado - Ficheiro muito grande '{filename_log}' ({size_bytes} bytes)")
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Ficheiro excede o limite máximo de {MAX_UPLOAD_BYTES / 1024 / 1024} MB")
     if size_bytes == 0:
+        logger.info(f"User {user_id}: Upload rejeitado - Ficheiro vazio '{filename_log}'")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ficheiro vazio não permitido.")
 
-    try:
-        file_hash = calculate_file_hash(file)
+    try: file_hash = calculate_file_hash(file)
     except Exception as e:
-        logger.error(f"Erro calculando hash do ficheiro {file.filename}: {e}")
+        logger.error(f"User {user_id}: Erro calculando hash '{filename_log}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro interno ao processar hash do ficheiro.")
-
     existing = session.query(File.id).filter(File.file_hash == file_hash).first()
     if existing:
-        logger.warning(f"Tentativa de upload de ficheiro duplicado (hash {file_hash}): {file.filename}")
+        logger.info(f"User {user_id}: Upload rejeitado - Hash duplicado '{file_hash}' ('{filename_log}')")
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ficheiro com este conteúdo já foi registado anteriormente.")
 
+    file_path = "N/A"
     try:
         original_name, ext = os.path.splitext(os.path.basename(file.filename))
-        clean_name = re.sub(r"[^\w\-.]", "_", original_name) # Permite pontos
+        clean_name = re.sub(r"[^\w\-.]", "_", original_name)
         timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")[:-3]
         safe_filename = f"{clean_name}_{timestamp}{ext}"
         file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
         with open(file_path, "wb") as buffer:
             file.file.seek(0)
-            while chunk := file.file.read(8192):
-                 buffer.write(chunk)
+            while chunk := file.file.read(8192): buffer.write(chunk)
             file.file.seek(0)
-
+        logger.info(f"User {user_id}: Arquivo físico salvo: {file_path}")
     except OSError as e:
-        logger.error(f"Erro de I/O ao salvar ficheiro {safe_filename} em {UPLOAD_DIR}: {e}")
+        logger.error(f"User {user_id}: Erro OSError ao salvar '{safe_filename}' em {UPLOAD_DIR}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro interno ao salvar ficheiro no servidor.")
     except Exception as e:
-        logger.exception(f"Erro inesperado ao preparar/salvar ficheiro {file.filename}: {e}")
-        if 'file_path' in locals() and os.path.exists(file_path):
-             try: os.remove(file_path)
-             except OSError: pass
+        logger.exception(f"User {user_id}: Erro inesperado ao salvar '{filename_log}': {e}")
+        if os.path.exists(file_path):
+             try: os.remove(file_path); logger.info(f"User {user_id}: Arquivo parcial removido: {file_path}")
+             except OSError: logger.warning(f"User {user_id}: Falha ao remover arquivo parcial {file_path}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro interno inesperado ao salvar ficheiro.")
 
     try:
@@ -106,29 +116,23 @@ def _create_file_sync(session: Session, file: UploadFile, user_id: str) -> tuple
         )
         session.add(new_file)
         session.flush()
-
-        analysis = Analysis(
-            file_id=new_file.id, user_id=user_id, status="pending"
-        )
+        analysis = Analysis(file_id=new_file.id, user_id=user_id, status="pending")
         session.add(analysis)
         session.commit()
-        session.refresh(new_file)
-        session.refresh(analysis)
-        logger.info(f"Ficheiro {new_file.id} ({new_file.file_name}) e Análise {analysis.id} criados para user {user_id}.")
-
+        session.refresh(new_file); session.refresh(analysis)
+        logger.info(f"User {user_id}: Ficheiro {new_file.id} ({safe_filename}) e Análise {analysis.id} criados no DB.")
     except sqlalchemy_exc.SQLAlchemyError as e:
         session.rollback()
-        logger.error(f"Erro de DB ao salvar registos para ficheiro {safe_filename} (hash {file_hash}): {e}")
+        logger.error(f"User {user_id}: Erro DB ao salvar registos ('{safe_filename}', Hash: {file_hash}): {e}")
         try:
-            if os.path.exists(file_path): os.remove(file_path)
-        except OSError as rm_e:
-            logger.warning(f"Não foi possível remover ficheiro órfão {file_path} após erro de DB: {rm_e}")
+            if os.path.exists(file_path): os.remove(file_path); logger.info(f"User {user_id}: Arquivo físico órfão removido: {file_path}")
+        except OSError as rm_e: logger.warning(f"User {user_id}: Falha remover {file_path} órfão: {rm_e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro interno ao registar ficheiro na base de dados.")
     except Exception as e:
         session.rollback()
-        logger.exception(f"Erro inesperado ao salvar registos DB para {safe_filename}: {e}")
+        logger.exception(f"User {user_id}: Erro inesperado ao salvar DB para '{safe_filename}': {e}")
         try:
-             if os.path.exists(file_path): os.remove(file_path)
+             if os.path.exists(file_path): os.remove(file_path); logger.info(f"User {user_id}: Arquivo físico órfão removido: {file_path}")
         except OSError: pass
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro interno inesperado no registo do ficheiro.")
 
@@ -136,40 +140,43 @@ def _create_file_sync(session: Session, file: UploadFile, user_id: str) -> tuple
 
 def get_files_query(session: Session):
     return session.query(File)
+
 def get_file_by_id(session: Session, file_id: str) -> File:
     file = session.query(File).filter(File.id == file_id).first()
     if not file:
+        logger.info(f"Tentativa de acesso a ficheiro não existente: ID {file_id}")
         raise HTTPException(status_code=404, detail="Ficheiro não encontrado")
     return file
+
 def get_file_by_hash(session: Session, file_hash: str) -> File | None:
     hash_file = session.query(File).filter(File.file_hash == file_hash).first()
     if not hash_file:
+        logger.info(f"Tentativa de acesso a ficheiro não existente: Hash {file_hash}")
         raise HTTPException(status_code=404, detail="Ficheiro não encontrado")
     return hash_file
 
-
 def delete_file(session: Session, file_id: str):
+    logger.info(f"Iniciando deleção do ficheiro ID: {file_id}")
     file = get_file_by_id(session, file_id)
-
     file_path_to_delete = file.file_path
+    filename_log = file.file_name
 
     try:
         session.delete(file)
         session.commit()
-        logger.info(f"Registro do ficheiro {file_id} ({os.path.basename(file_path_to_delete)}) deletado do DB.")
+        logger.info(f"Registro DB do ficheiro {file_id} ('{filename_log}') deletado com sucesso.")
     except sqlalchemy_exc.SQLAlchemyError as e:
         session.rollback()
-        logger.error(f"Erro de DB ao tentar deletar ficheiro {file_id}: {e}")
+        logger.error(f"Erro DB ao deletar ficheiro {file_id} ('{filename_log}'): {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro ao deletar registro do ficheiro.")
 
     try:
         if file_path_to_delete and os.path.exists(file_path_to_delete):
             os.remove(file_path_to_delete)
-            logger.info(f"Ficheiro físico {file_path_to_delete} removido.")
+            logger.info(f"Ficheiro físico removido com sucesso: {file_path_to_delete}")
         elif file_path_to_delete:
-             logger.warning(f"Registro DB do ficheiro {file_id} deletado, mas arquivo físico não encontrado em {file_path_to_delete}.")
-
+             logger.warning(f"Registro DB {file_id} deletado, mas arquivo físico não encontrado: {file_path_to_delete}")
     except OSError as e:
-        logger.warning(f"Erro de I/O ao tentar remover ficheiro físico {file_path_to_delete} após deletar registro DB: {e}")
+        logger.warning(f"Erro OSError ao remover ficheiro físico {file_path_to_delete} (ID DB: {file_id}): {e}")
     except Exception as e:
-        logger.warning(f"Erro inesperado ao tentar remover ficheiro físico {file_path_to_delete}: {e}")
+        logger.warning(f"Erro inesperado ao remover ficheiro físico {file_path_to_delete} (ID DB: {file_id})", exc_info=True)
