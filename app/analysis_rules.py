@@ -4,16 +4,17 @@ from db.models import Alert
 from urllib.parse import unquote_plus
 
 PORT_SCAN_THRESHOLD = 10 # Alerta se um IP tentar aceder a mais de 10 portas num único host
+BRUTE_FORCE_THRESHOLD = 10 # Alerta após 10 tentativas de login falhadas
 
 class RulesEngine:
     def __init__(self, analysis_id: str, custom_payload_rules: list = [], custom_port_rules: list = []):
         self.analysis_id = analysis_id
-        self.port_scan_tracker = defaultdict(lambda: defaultdict(set))
         self.custom_port_tracker = set()
         self.custom_payload_tracker = set()
-        
+        self.port_scan_tracker = defaultdict(lambda: defaultdict(set))
+        self.bruteforce_tracker = defaultdict(int)
+        self.bruteforce_alerted = set()
         self.custom_payload_rules = custom_payload_rules
-        
         self.custom_port_rules_map = {}
         for rule in custom_port_rules:
             try:
@@ -26,17 +27,21 @@ class RulesEngine:
         
         info = self._extract_packet_info(pkt)
 
-        if info['dst_port'] in [80, 443, 8080] or info['src_port'] in [80, 443, 8080]:
+        if info['payload']:
             try:
-                info['decoded_payload'] = unquote_plus(info['payload'].decode('utf-8', errors='ignore')).lower()
+                if info['dst_port'] in [80, 443, 8080] or info['src_port'] in [80, 443, 8080]:
+                    info['decoded_payload'] = unquote_plus(info['payload'].decode('utf-8', errors='ignore')).lower()
+                else:
+                    info['decoded_payload'] = info['payload'].decode('utf-8', errors='ignore').lower()
             except Exception:
-                info['decoded_payload'] = info['payload'].decode('utf-8', errors='ignore').lower()
+                info['decoded_payload'] = None
         else:
             info['decoded_payload'] = None
 
         alerts.extend(self._rule_detect_custom_port(info))
         alerts.extend(self._rule_detect_custom_payload(info))
         alerts.extend(self._rule_detect_port_scan(info, pkt))
+        alerts.extend(self._rule_detect_bruteforce(info)) # NOVO
         
         return alerts
 
@@ -141,4 +146,55 @@ class RulesEngine:
                 evidence=f"IP de origem {info['src_ip']} enviou pacotes SYN para {len(tracker)} portas no destino {info['dst_ip']}."
             ))
             tracker.add('alerted')
+        return alerts
+
+    def _rule_detect_bruteforce(self, info: dict) -> list[Alert]:
+        alerts = []
+        
+        if not info['decoded_payload']:
+            return alerts
+
+        failure_signatures = [
+            "530 login incorrect",    
+            "http/1.1 401 unauthorized",
+            "authentication failed"
+        ]
+        
+        is_failure = False
+        for sig in failure_signatures:
+            if sig in info['decoded_payload']:
+                is_failure = True
+                break
+        
+        if not is_failure:
+            return alerts
+
+        attacker_ip = info.get('dst_ip')
+        victim_ip = info.get('src_ip')   
+        victim_port = info.get('src_port') 
+        
+        if not all([attacker_ip, victim_ip, victim_port]):
+            return alerts
+
+        tracker_key = (attacker_ip, victim_ip, victim_port)
+        
+        if tracker_key in self.bruteforce_alerted:
+            return alerts
+
+        self.bruteforce_tracker[tracker_key] += 1
+        
+        if self.bruteforce_tracker[tracker_key] > BRUTE_FORCE_THRESHOLD:
+            alerts.append(Alert(
+                analysis_id=self.analysis_id,
+                alert_type="brute_force_detected",
+                severity="critical",
+                src_ip=attacker_ip,  
+                dst_ip=victim_ip,   
+                port=victim_port,  
+                protocol=info['proto'],
+                evidence=f"Detetadas {self.bruteforce_tracker[tracker_key]} tentativas de login falhadas de {attacker_ip} para {victim_ip}:{victim_port}"
+            ))
+            
+            self.bruteforce_alerted.add(tracker_key)
+        
         return alerts
