@@ -2,6 +2,7 @@ import os
 import asyncio
 import time
 import pyshark
+import string
 from sqlalchemy.orm import Session
 from typing import Dict
 from db.models import Analysis, Stream, Stat, IpRecord, File, Alert
@@ -12,6 +13,37 @@ from analysis_rules import RulesEngine
 UPLOAD_DIR = UPLOAD_DIRECTORY
 STREAMS_DIR = os.path.join(UPLOAD_DIR, "streams")
 os.makedirs(STREAMS_DIR, exist_ok=True)
+
+SUSPECT_CHARS_SET = set(
+    list(range(0x00, 0x09)) +  # NUL até BS
+    [0x0B, 0x0C] +            # VT, FF
+    list(range(0x0E, 0x20)) +  # SO até US
+    list(range(0x80, 0x100))   # High-ASCII (0x80 a 0xFF)
+)
+
+# Threshold: Se mais de 15% do payload for "suspeito", consideramos não legível.
+SUSPECT_THRESHOLD_PERCENT = 15.0
+
+def is_payload_readable(payload: bytes) -> bool:
+    if not payload:
+        return False
+        
+    total_len = len(payload)
+    if total_len == 0:
+        return False
+    
+    try:
+        payload.decode('utf-8', errors='strict')
+        return True
+    except UnicodeDecodeError:
+        pass
+    except Exception:
+        pass
+
+    suspect_count = sum(1 for byte in payload if byte in SUSPECT_CHARS_SET)
+    suspect_percentage = (suspect_count / total_len) * 100
+    
+    return suspect_percentage <= SUSPECT_THRESHOLD_PERCENT
 
 def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis:
     try:
@@ -48,25 +80,28 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
             protocol_counts[proto] = protocol_counts.get(proto, 0) + 1
 
             src, dst = (pkt.ip.src, pkt.ip.dst) if hasattr(pkt, 'ip') else \
-                       (pkt.ipv6.src, pkt.ipv6.dst) if hasattr(pkt, 'ipv6') else (None, None)
+                         (pkt.ipv6.src, pkt.ipv6.dst) if hasattr(pkt, 'ipv6') else (None, None)
             
             if src: ip_counts[src] = ip_counts.get(src, 0) + 1
             if dst: ip_counts[dst] = ip_counts.get(dst, 0) + 1
 
             sport, dport = (int(pkt.tcp.srcport), int(pkt.tcp.dstport)) if hasattr(pkt, 'tcp') else \
-                           (int(pkt.udp.srcport), int(pkt.udp.dstport)) if hasattr(pkt, 'udp') else (None, None)
+                             (int(pkt.udp.srcport), int(pkt.udp.dstport)) if hasattr(pkt, 'udp') else (None, None)
             
             if sport: port_counts[sport] = port_counts.get(sport, 0) + 1
             if dport: port_counts[dport] = port_counts.get(dport, 0) + 1
 
             stream_key = f"tcp-{pkt.tcp.stream}" if hasattr(pkt, 'tcp') and hasattr(pkt.tcp, 'stream') else \
-                         f"{src}:{sport}-{dst}:{dport}" if all([src, dst, sport, dport]) else f"pkt-{total_packets}"
+                           f"{src}:{sport}-{dst}:{dport}" if all([src, dst, sport, dport]) else f"pkt-{total_packets}"
 
             if stream_key not in streams_map:
-                streams_map[stream_key] = {"packets": [], "stream_number": len(streams_map) + 1}
+                streams_map[stream_key] = {"packets": [], "stream_number": len(streams_map) + 1, "is_encrypted": False}
+            
+            if pkt.highest_layer == "TLS":
+                streams_map[stream_key]["is_encrypted"] = True
             
             payload_bytes = bytes.fromhex(pkt.tcp.payload.replace(":", "")) if hasattr(pkt, 'tcp') and hasattr(pkt.tcp, 'payload') else \
-                            bytes.fromhex(pkt.udp.payload.replace(":", "")) if hasattr(pkt, 'udp') and hasattr(pkt.udp, 'payload') else b''
+                              bytes.fromhex(pkt.udp.payload.replace(":", "")) if hasattr(pkt, 'udp') and hasattr(pkt.udp, 'payload') else b''
 
             streams_map[stream_key]["packets"].append({"payload": payload_bytes})
 
@@ -84,8 +119,15 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
     
     stream_count = 0
     for meta in streams_map.values():
+        
+        if meta.get("is_encrypted", False):
+            continue
+            
         full_payload = b"".join(p["payload"] for p in meta["packets"] if p.get("payload"))
         if not full_payload:
+            continue
+        
+        if not is_payload_readable(full_payload):
             continue
         
         stream_count += 1
@@ -93,8 +135,12 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
         stream_path = os.path.join(STREAMS_DIR, stream_filename)
         with open(stream_path, "wb") as sf:
             sf.write(full_payload)
-        
-        preview = full_payload[:200].hex()
+
+        try:
+            preview = full_payload[:200].decode('utf-8', errors='ignore')
+        except:
+            preview = full_payload[:200].hex()
+            
         session.add(Stream(
             analysis_id=analysis.id, stream_number=meta["stream_number"],
             content_path=stream_path, preview=preview
