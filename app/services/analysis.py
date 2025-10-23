@@ -5,9 +5,9 @@ import pyshark
 import string
 import logging
 from sqlalchemy.orm import Session
-from typing import Dict
+from typing import Dict, Tuple, List
 from db.models import Analysis, Stream, Stat, IpRecord, File, Alert
-from db.models import CustomRule 
+from db.models import CustomRule
 from datetime import datetime, timezone
 from core.config import UPLOAD_DIRECTORY
 from analysis_rules import RulesEngine
@@ -15,7 +15,7 @@ from analysis_rules import RulesEngine
 UPLOAD_DIR = UPLOAD_DIRECTORY
 STREAMS_DIR = os.path.join(UPLOAD_DIR, "streams")
 os.makedirs(STREAMS_DIR, exist_ok=True)
-logger = logging.getLogger("sharpshark")
+logger = logging.getLogger("sharpshark.analysis") 
 
 SUSPECT_CHARS_SET = set(
     list(range(0x00, 0x09)) +
@@ -25,89 +25,81 @@ SUSPECT_CHARS_SET = set(
 )
 SUSPECT_THRESHOLD_PERCENT = 15.0
 def is_payload_readable(payload: bytes) -> bool:
-    if not payload:
-        return False
+    if not payload: return False
     total_len = len(payload)
-    if total_len == 0:
-        return False
+    if total_len == 0: return False
     try:
         payload.decode('utf-8', errors='strict')
         return True
-    except UnicodeDecodeError:
-        pass
-    except Exception:
-        pass
+    except UnicodeDecodeError: pass
+    except Exception: pass
     suspect_count = sum(1 for byte in payload if byte in SUSPECT_CHARS_SET)
     suspect_percentage = (suspect_count / total_len) * 100
     return suspect_percentage <= SUSPECT_THRESHOLD_PERCENT
 
 
-def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-    
-    start_time = time.perf_counter()
-    pcap_path = file_obj.file_path
-
-    analysis = session.query(Analysis).filter(Analysis.id == analysis_id).first()
-    if not analysis:
-        raise RuntimeError(f"Análise {analysis_id} não encontrada no início de analyze_file.")
-
+def _initialize_analysis_state(session: Session, analysis_id: str) -> Tuple[RulesEngine, Dict, Dict, Dict, Dict, Dict]:
+    logger.info(f"Análise {analysis_id}: Carregando regras globais...")
     all_rules = session.query(CustomRule).all()
     payload_rules = [r for r in all_rules if r.rule_type == 'payload']
     port_rules = [r for r in all_rules if r.rule_type == 'port']
-    logger.info(f"Regras carregadas: {len(payload_rules)} de payload, {len(port_rules)} de porta.")
-    
+    logger.info(f"Análise {analysis_id}: Regras carregadas ({len(payload_rules)} payload, {len(port_rules)} porta).")
+
     rules_engine = RulesEngine(
-        analysis_id=analysis.id,
+        analysis_id=analysis_id,
         custom_payload_rules=payload_rules,
         custom_port_rules=port_rules
     )
-    
+
     protocol_counts: Dict[str, int] = {}
     port_counts: Dict[int, int] = {}
-    src_ip_counts: Dict[str, int] = {} 
-    dst_ip_counts: Dict[str, int] = {} 
-    streams_map: Dict[str, Dict] = {} 
-    total_packets = 0
+    src_ip_counts: Dict[str, int] = {}
+    dst_ip_counts: Dict[str, int] = {}
+    streams_map: Dict[str, Dict] = {}
 
+    return rules_engine, protocol_counts, port_counts, src_ip_counts, dst_ip_counts, streams_map
+
+def _process_packet_capture(
+    pcap_path: str,
+    rules_engine: RulesEngine,
+    protocol_counts: Dict,
+    port_counts: Dict,
+    src_ip_counts: Dict,
+    dst_ip_counts: Dict,
+    streams_map: Dict,
+    session: Session
+) -> int:
+    total_packets = 0
     try:
         capture = pyshark.FileCapture(pcap_path, keep_packets=False, use_json=True, include_raw=True)
-        
+        logger.info(f"Análise {rules_engine.analysis_id}: Iniciando captura de pacotes de {pcap_path}")
+
         for pkt in capture:
             total_packets += 1
             new_alerts = rules_engine.process_packet(pkt)
-            
+
             proto = pkt.highest_layer
-            
             if not proto or proto.lower() == 'data':
                 if hasattr(pkt, 'tcp'): proto = 'TCP'
                 elif hasattr(pkt, 'udp'): proto = 'UDP'
                 elif hasattr(pkt, 'arp'): proto = 'ARP'
                 elif hasattr(pkt, 'icmp'): proto = 'ICMP'
                 elif hasattr(pkt, 'ip'): proto = 'IP'
-                else: 
-                    proto = next((lay.layer_name for lay in pkt.layers), "UNKNOWN")
-            
+                else: proto = next((lay.layer_name for lay in pkt.layers), "UNKNOWN")
             proto_str = str(proto).upper()
-            
-            if proto_str.endswith('_RAW'):
-                proto_str = proto_str[:-4]
-                
+            if proto_str.endswith('_RAW'): proto_str = proto_str[:-4]
             protocol_counts[proto_str] = protocol_counts.get(proto_str, 0) + 1
-                        
+
             src, dst = (pkt.ip.src, pkt.ip.dst) if hasattr(pkt, 'ip') else \
                          (pkt.ipv6.src, pkt.ipv6.dst) if hasattr(pkt, 'ipv6') else (None, None)
-            
             if src: src_ip_counts[src] = src_ip_counts.get(src, 0) + 1
             if dst: dst_ip_counts[dst] = dst_ip_counts.get(dst, 0) + 1
-            
+
             sport, dport = (int(pkt.tcp.srcport), int(pkt.tcp.dstport)) if hasattr(pkt, 'tcp') else \
                              (int(pkt.udp.srcport), int(pkt.udp.dstport)) if hasattr(pkt, 'udp') else (None, None)
             if sport: port_counts[sport] = port_counts.get(sport, 0) + 1
             if dport: port_counts[dport] = port_counts.get(dport, 0) + 1
+
             stream_key = f"tcp-{pkt.tcp.stream}" if hasattr(pkt, 'tcp') and hasattr(pkt.tcp, 'stream') else \
                            f"{src}:{sport}-{dst}:{dport}" if all([src, dst, sport, dport]) else f"pkt-{total_packets}"
 
@@ -115,85 +107,175 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
                 streams_map[stream_key] = {"packets": [], "stream_number": len(streams_map) + 1, "is_encrypted": False}
             if pkt.highest_layer == "TLS":
                 streams_map[stream_key]["is_encrypted"] = True
-            
+
             if new_alerts:
                 if "pending_alerts" not in streams_map[stream_key]:
                     streams_map[stream_key]["pending_alerts"] = []
                 streams_map[stream_key]["pending_alerts"].extend(new_alerts)
-            
+
             payload_bytes = bytes.fromhex(pkt.tcp.payload.replace(":", "")) if hasattr(pkt, 'tcp') and hasattr(pkt.tcp, 'payload') else \
                               bytes.fromhex(pkt.udp.payload.replace(":", "")) if hasattr(pkt, 'udp') and hasattr(pkt.udp, 'payload') else b''
             streams_map[stream_key]["packets"].append({"payload": payload_bytes})
 
-            if total_packets % 500 == 0:
+            if total_packets % 1000 == 0:
+                logger.debug(f"Análise {rules_engine.analysis_id}: Processados {total_packets} pacotes. Committing...")
                 session.commit()
 
         capture.close()
+        logger.info(f"Análise {rules_engine.analysis_id}: Captura concluída. Total de {total_packets} pacotes.")
 
+    except pyshark.capture.capture.TSharkCrashException as e:
+        logger.error(f"Análise {rules_engine.analysis_id}: TShark crashou durante a captura: {e}")
+        raise RuntimeError(f"TShark crashou: {e}")
     except Exception as e:
-        analysis.status = "failed"
-        fail_alert = Alert(analysis_id=analysis.id, alert_type="analysis_error", severity="critical", evidence=str(e)[:2000])
-        session.add(fail_alert)
-        session.commit()
-        raise
-    
+        logger.exception(f"Análise {rules_engine.analysis_id}: Erro inesperado durante processamento de pacotes no pacote ~{total_packets}: {e}")
+        raise 
+
+    return total_packets
+
+def _save_analysis_streams(session: Session, analysis_id: str, streams_map: Dict) -> int:
     stream_count = 0
-    for meta in streams_map.values():
+    logger.info(f"Análise {analysis_id}: Iniciando salvamento de streams...")
+    for stream_key, meta in streams_map.items():
         if meta.get("is_encrypted", False):
             continue
+
         full_payload = b"".join(p["payload"] for p in meta["packets"] if p.get("payload"))
         if not full_payload or not is_payload_readable(full_payload):
             continue
+
         stream_count += 1
-        stream_filename = f"{analysis.id}_stream_{stream_count}.bin"
+        stream_filename = f"{analysis_id}_stream_{stream_count}.bin"
         stream_path = os.path.join(STREAMS_DIR, stream_filename)
-        with open(stream_path, "wb") as sf:
-            sf.write(full_payload)
+
+        try:
+            with open(stream_path, "wb") as sf:
+                sf.write(full_payload)
+        except OSError as e:
+            logger.error(f"Análise {analysis_id}: Falha ao salvar arquivo do stream {stream_count} ({stream_path}): {e}")
+            continue
+
         try:
             preview = full_payload[:200].decode('utf-8', errors='ignore')
         except:
             preview = full_payload[:200].hex()
+
         new_stream = Stream(
-            analysis_id=analysis.id, stream_number=meta["stream_number"],
+            analysis_id=analysis_id, stream_number=meta["stream_number"],
             content_path=stream_path, preview=preview
         )
         session.add(new_stream)
-        try:
-            session.flush() 
-        except Exception as e:
-            logger.error(f"Erro ao 'flushar' stream: {e}")
-            session.rollback()
-            continue
-        if "pending_alerts" in meta:
-            for alert in meta["pending_alerts"]:
-                alert.stream_id = new_stream.id 
-                session.add(alert)
 
+        try:
+            session.flush()
+            if "pending_alerts" in meta:
+                for alert in meta["pending_alerts"]:
+                    alert.stream_id = new_stream.id
+                    session.add(alert)
+        except Exception as e: 
+            logger.error(f"Análise {analysis_id}: Erro ao salvar stream {stream_count} ou seus alertas no DB: {e}. Rollback do stream.")
+            session.rollback()
+            try:
+                if os.path.exists(stream_path):
+                    os.remove(stream_path)
+            except OSError as rm_e:
+                logger.warning(f"Análise {analysis_id}: Não foi possível remover arquivo órfão do stream {stream_count}: {rm_e}")
+            stream_count -= 1
+            continue
+
+    logger.info(f"Análise {analysis_id}: Salvamento de streams concluído. {stream_count} streams salvos.")
+    return stream_count
+
+def _save_analysis_stats(session: Session, analysis_id: str, protocol_counts: Dict, port_counts: Dict):
+    logger.info(f"Análise {analysis_id}: Salvando estatísticas...")
     for proto, cnt in protocol_counts.items():
-        session.add(Stat(analysis_id=analysis.id, category="protocol", key=proto, count=cnt))
+        session.add(Stat(analysis_id=analysis_id, category="protocol", key=proto, count=cnt))
     for port, cnt in port_counts.items():
-        session.add(Stat(analysis_id=analysis.id, category="port", key=str(port), count=cnt))
+        session.add(Stat(analysis_id=analysis_id, category="port", key=str(port), count=cnt))
+    logger.info(f"Análise {analysis_id}: Estatísticas salvas.")
+
+def _save_analysis_ip_records(session: Session, analysis_id: str, src_ip_counts: Dict, dst_ip_counts: Dict):
+    logger.info(f"Análise {analysis_id}: Salvando registros de IP...")
     for ip, cnt in src_ip_counts.items():
-        session.add(IpRecord(
-            analysis_id=analysis.id, 
-            ip=ip, 
-            role="SRC", 
-            count=cnt
-        ))
+        session.add(IpRecord(analysis_id=analysis_id, ip=ip, role="SRC", count=cnt))
     for ip, cnt in dst_ip_counts.items():
-        session.add(IpRecord(
-            analysis_id=analysis.id, 
-            ip=ip, 
-            role="DST", 
-            count=cnt
-        ))
-    
+        session.add(IpRecord(analysis_id=analysis_id, ip=ip, role="DST", count=cnt))
+    logger.info(f"Análise {analysis_id}: Registros de IP salvos.")
+
+def _finalize_analysis(session: Session, analysis: Analysis, total_packets: int, stream_count: int, start_time: float):
     end_time = time.perf_counter()
     analysis.status = "completed"
     analysis.total_packets = total_packets
     analysis.total_streams = stream_count
     analysis.duration = round(end_time - start_time, 3)
     analysis.analyzed_at = datetime.now(timezone.utc)
-    
-    session.commit()
+    logger.info(f"Análise {analysis.id}: Finalizada com status '{analysis.status}'. Duração: {analysis.duration}s")
+
+def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    start_time = time.perf_counter()
+    pcap_path = file_obj.file_path
+
+    analysis = session.query(Analysis).filter(Analysis.id == analysis_id).first()
+    if not analysis:
+        logger.error(f"CRÍTICO: Análise {analysis_id} referenciada pela tarefa não existe no DB.")
+        raise RuntimeError(f"Análise {analysis_id} não encontrada no início de analyze_file.")
+
+    try:
+        rules_engine, protocol_counts, port_counts, src_ip_counts, dst_ip_counts, streams_map = \
+            _initialize_analysis_state(session, analysis_id)
+
+        total_packets = _process_packet_capture(
+            pcap_path, rules_engine, protocol_counts, port_counts,
+            src_ip_counts, dst_ip_counts, streams_map, session
+        )
+
+        stream_count = _save_analysis_streams(session, analysis_id, streams_map)
+
+        _save_analysis_stats(session, analysis_id, protocol_counts, port_counts)
+
+        _save_analysis_ip_records(session, analysis_id, src_ip_counts, dst_ip_counts)
+
+        _finalize_analysis(session, analysis, total_packets, stream_count, start_time)
+
+        session.commit()
+        logger.info(f"Análise {analysis_id}: Commit final bem-sucedido.")
+
+    except Exception as e:
+        logger.exception(f"Análise {analysis_id}: Falha GERAL durante a análise: {e}")
+        _mark_analysis_status_in_new_session(analysis_id, "failed")
+        try:
+            fail_alert = Alert(analysis_id=analysis_id, alert_type="analysis_error", severity="critical", evidence=f"Erro geral: {str(e)[:1990]}")
+            session.rollback()
+            session.add(fail_alert)
+            session.commit()
+        except Exception as db_err:
+            logger.error(f"Análise {analysis_id}: Falha ao salvar o alerta de erro no DB: {db_err}")
+            session.rollback()
+        raise
+
     return analysis
+
+def _mark_analysis_status_in_new_session(analysis_id: str, status: str):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    db_engine = create_engine("sqlite:///./db/database.db")
+    SessionLocalNew = sessionmaker(bind=db_engine)
+    session_new = SessionLocalNew()
+    try:
+        analysis = session_new.query(Analysis).filter(Analysis.id == analysis_id).first()
+        if analysis:
+            analysis.status = status
+            session_new.commit()
+            logger.info(f"Análise {analysis_id}: Status atualizado para '{status}' em sessão separada.")
+        else:
+             logger.warning(f"Análise {analysis_id}: Tentativa de marcar status '{status}', mas análise não foi encontrada na sessão separada.")
+    except Exception as db_e:
+        logger.error(f"Análise {analysis_id}: Falha CRÍTICA ao atualizar o status para '{status}' em sessão separada: {db_e}")
+        session_new.rollback()
+    finally:
+        session_new.close()

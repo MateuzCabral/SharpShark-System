@@ -3,8 +3,8 @@ from collections import defaultdict
 from db.models import Alert
 from urllib.parse import unquote_plus
 
-PORT_SCAN_THRESHOLD = 10 # Alerta se um IP tentar aceder a mais de 10 portas num único host
-BRUTE_FORCE_THRESHOLD = 10 # Alerta após 10 tentativas de login falhadas
+PORT_SCAN_THRESHOLD = 10
+BRUTE_FORCE_THRESHOLD = 10
 
 class RulesEngine:
     def __init__(self, analysis_id: str, custom_payload_rules: list = [], custom_port_rules: list = []):
@@ -20,16 +20,15 @@ class RulesEngine:
             try:
                 self.custom_port_rules_map[int(rule.value)] = rule
             except:
-                pass 
+                pass
 
     def process_packet(self, pkt) -> list[Alert]:
         alerts = []
-        
         info = self._extract_packet_info(pkt)
 
         if info['payload']:
             try:
-                if info['dst_port'] in [80, 443, 8080] or info['src_port'] in [80, 443, 8080]:
+                if info.get('dst_port') in [80, 443, 8080] or info.get('src_port') in [80, 443, 8080]:
                     info['decoded_payload'] = unquote_plus(info['payload'].decode('utf-8', errors='ignore')).lower()
                 else:
                     info['decoded_payload'] = info['payload'].decode('utf-8', errors='ignore').lower()
@@ -41,77 +40,89 @@ class RulesEngine:
         alerts.extend(self._rule_detect_custom_port(info))
         alerts.extend(self._rule_detect_custom_payload(info))
         alerts.extend(self._rule_detect_port_scan(info, pkt))
-        alerts.extend(self._rule_detect_bruteforce(info)) # NOVO
-        
+        alerts.extend(self._rule_detect_bruteforce(info))
+
         return alerts
 
     def _extract_packet_info(self, pkt) -> dict:
         info = {
             "src_ip": None, "dst_ip": None,
             "src_port": None, "dst_port": None,
-            "proto": next((lay.layer_name for lay in pkt.layers), "unknown"),
-            "payload": b""
+            "proto": "UNKNOWN",
+            "payload": b"",
+            "decoded_payload": None
         }
+
         if hasattr(pkt, 'ip'):
             info['src_ip'] = pkt.ip.src
             info['dst_ip'] = pkt.ip.dst
         elif hasattr(pkt, 'ipv6'):
             info['src_ip'] = pkt.ipv6.src
             info['dst_ip'] = pkt.ipv6.dst
-            
+
+        transport_layer = None
         if hasattr(pkt, 'tcp'):
-            info['src_port'] = int(pkt.tcp.srcport)
-            info['dst_port'] = int(pkt.tcp.dstport)
-            if hasattr(pkt.tcp, 'payload'):
-                info['payload'] = bytes.fromhex(pkt.tcp.payload.replace(":", ""))
+            transport_layer = pkt.tcp
+            info['src_port'] = int(transport_layer.srcport)
+            info['dst_port'] = int(transport_layer.dstport)
         elif hasattr(pkt, 'udp'):
-            info['src_port'] = int(pkt.udp.srcport)
-            info['dst_port'] = int(pkt.udp.dstport)
-            if hasattr(pkt.udp, 'payload'):
-                info['payload'] = bytes.fromhex(pkt.udp.payload.replace(":", ""))
+            transport_layer = pkt.udp
+            info['src_port'] = int(transport_layer.srcport)
+            info['dst_port'] = int(transport_layer.dstport)
+
+        if transport_layer and hasattr(transport_layer, 'payload'):
+            try:
+                if isinstance(transport_layer.payload, list):
+                     payload_hex = "".join(transport_layer.payload).replace(":", "")
+                else:
+                     payload_hex = str(transport_layer.payload).replace(":", "")
+                info['payload'] = bytes.fromhex(payload_hex)
+            except (ValueError, TypeError) as e:
+                info['payload'] = b"" 
+
+        proto = pkt.highest_layer
+        if not proto or str(proto).lower() == 'data':
+            if hasattr(pkt, 'tcp'): proto = 'TCP'
+            elif hasattr(pkt, 'udp'): proto = 'UDP'
+            elif hasattr(pkt, 'arp'): proto = 'ARP'
+            elif hasattr(pkt, 'icmp'): proto = 'ICMP'
+            elif hasattr(pkt, 'ip'): proto = 'IP'
+            else: proto = next((lay.layer_name for lay in pkt.layers), "UNKNOWN")
+
+        proto_str = str(proto).upper()
+        if proto_str.endswith('_RAW'): proto_str = proto_str[:-4]
+
+        info['proto'] = proto_str
 
         return info
-    
+
     def _rule_detect_custom_port(self, info: dict) -> list[Alert]:
         alerts = []
         dst_port = info.get('dst_port')
-        
         rule = self.custom_port_rules_map.get(dst_port)
-        if not rule:
-            return alerts
-            
+        if not rule: return alerts
         tracker_key = (info['src_ip'], dst_port)
         if tracker_key not in self.custom_port_tracker:
             alerts.append(Alert(
-                analysis_id=self.analysis_id, 
-                alert_type=rule.alert_type,
-                severity=rule.severity, 
-                src_ip=info['src_ip'], 
-                dst_ip=info['dst_ip'],
-                port=dst_port, 
+                analysis_id=self.analysis_id, alert_type=rule.alert_type, severity=rule.severity,
+                src_ip=info['src_ip'], dst_ip=info['dst_ip'], port=dst_port,
                 protocol=info['proto'],
                 evidence=f"Detetada conexão à porta customizada {dst_port} (Regra: {rule.name})"
             ))
             self.custom_port_tracker.add(tracker_key)
-            
         return alerts
 
     def _rule_detect_custom_payload(self, info: dict) -> list[Alert]:
         alerts = []
-        if not info['decoded_payload'] or not self.custom_payload_rules:
-            return alerts
-            
+        if not info['decoded_payload'] or not self.custom_payload_rules: return alerts
         for rule in self.custom_payload_rules:
             if rule.value.lower() in info['decoded_payload']:
-                
                 tracker_key = (info['src_ip'], info['dst_ip'], rule.id)
                 if tracker_key not in self.custom_payload_tracker:
                     alerts.append(Alert(
-                        analysis_id=self.analysis_id,
-                        alert_type=rule.alert_type,
-                        severity=rule.severity,
-                        src_ip=info['src_ip'], dst_ip=info['dst_ip'],
-                        port=info['dst_port'], protocol=info['proto'],
+                        analysis_id=self.analysis_id, alert_type=rule.alert_type, severity=rule.severity,
+                        src_ip=info['src_ip'], dst_ip=info['dst_ip'], port=info.get('dst_port'),
+                        protocol=info['proto'],
                         evidence=f"Detetada assinatura de payload customizado (Regra: {rule.name})"
                     ))
                     self.custom_payload_tracker.add(tracker_key)
@@ -119,30 +130,20 @@ class RulesEngine:
 
     def _rule_detect_port_scan(self, info: dict, pkt) -> list[Alert]:
         alerts = []
-        if info['proto'] != 'tcp' or not info['src_ip'] or not info['dst_ip']:
-            return alerts
-            
+        if info['proto'] != 'TCP' or not info['src_ip'] or not info['dst_ip']: return alerts
         is_syn_packet = False
         try:
-            if pkt.tcp.flags_syn == '1' and pkt.tcp.flags_ack == '0':
-                is_syn_packet = True
-        except AttributeError:
-            return alerts 
-
-        if not is_syn_packet:
-            return alerts
-            
+            if pkt.tcp.flags_syn == '1' and pkt.tcp.flags_ack == '0': is_syn_packet = True
+        except AttributeError: return alerts
+        if not is_syn_packet: return alerts
         tracker = self.port_scan_tracker[info['src_ip']][info['dst_ip']]
-        
-        if 'alerted' in tracker:
-            return alerts
-            
+        if 'alerted' in tracker: return alerts
         tracker.add(info['dst_port'])
-        
         if len(tracker) > PORT_SCAN_THRESHOLD:
             alerts.append(Alert(
-                analysis_id=self.analysis_id, alert_type="port_scan_detected",
-                severity="high", src_ip=info['src_ip'], dst_ip=info['dst_ip'],
+                analysis_id=self.analysis_id, alert_type="port_scan_detected", severity="high",
+                src_ip=info['src_ip'], dst_ip=info['dst_ip'],
+                protocol=info['proto'],
                 evidence=f"IP de origem {info['src_ip']} enviou pacotes SYN para {len(tracker)} portas no destino {info['dst_ip']}."
             ))
             tracker.add('alerted')
@@ -150,51 +151,23 @@ class RulesEngine:
 
     def _rule_detect_bruteforce(self, info: dict) -> list[Alert]:
         alerts = []
-        
-        if not info['decoded_payload']:
-            return alerts
-
-        failure_signatures = [
-            "530 login incorrect",    
-            "http/1.1 401 unauthorized",
-            "authentication failed"
-        ]
-        
-        is_failure = False
-        for sig in failure_signatures:
-            if sig in info['decoded_payload']:
-                is_failure = True
-                break
-        
-        if not is_failure:
-            return alerts
-
+        if not info['decoded_payload']: return alerts
+        failure_signatures = ["530 login incorrect", "http/1.1 401 unauthorized", "authentication failed"]
+        is_failure = any(sig in info['decoded_payload'] for sig in failure_signatures)
+        if not is_failure: return alerts
         attacker_ip = info.get('dst_ip')
-        victim_ip = info.get('src_ip')   
-        victim_port = info.get('src_port') 
-        
-        if not all([attacker_ip, victim_ip, victim_port]):
-            return alerts
-
+        victim_ip = info.get('src_ip')
+        victim_port = info.get('src_port')
+        if not all([attacker_ip, victim_ip, victim_port]): return alerts
         tracker_key = (attacker_ip, victim_ip, victim_port)
-        
-        if tracker_key in self.bruteforce_alerted:
-            return alerts
-
+        if tracker_key in self.bruteforce_alerted: return alerts
         self.bruteforce_tracker[tracker_key] += 1
-        
         if self.bruteforce_tracker[tracker_key] > BRUTE_FORCE_THRESHOLD:
             alerts.append(Alert(
-                analysis_id=self.analysis_id,
-                alert_type="brute_force_detected",
-                severity="critical",
-                src_ip=attacker_ip,  
-                dst_ip=victim_ip,   
-                port=victim_port,  
+                analysis_id=self.analysis_id, alert_type="brute_force_detected", severity="critical",
+                src_ip=attacker_ip, dst_ip=victim_ip, port=victim_port,
                 protocol=info['proto'],
                 evidence=f"Detetadas {self.bruteforce_tracker[tracker_key]} tentativas de login falhadas de {attacker_ip} para {victim_ip}:{victim_port}"
             ))
-            
             self.bruteforce_alerted.add(tracker_key)
-        
         return alerts
