@@ -68,10 +68,8 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
     
     protocol_counts: Dict[str, int] = {}
     port_counts: Dict[int, int] = {}
-    
-    src_ip_counts: Dict[str, int] = {}
-    dst_ip_counts: Dict[str, int] = {}
-    
+    src_ip_counts: Dict[str, int] = {} 
+    dst_ip_counts: Dict[str, int] = {} 
     streams_map: Dict[str, Dict] = {} 
     total_packets = 0
 
@@ -82,13 +80,28 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
             total_packets += 1
             new_alerts = rules_engine.process_packet(pkt)
             
-            proto = next((lay.layer_name for lay in pkt.layers), "unknown")
-            protocol_counts[proto] = protocol_counts.get(proto, 0) + 1
+            proto = pkt.highest_layer
             
+            if not proto or proto.lower() == 'data':
+                if hasattr(pkt, 'tcp'): proto = 'TCP'
+                elif hasattr(pkt, 'udp'): proto = 'UDP'
+                elif hasattr(pkt, 'arp'): proto = 'ARP'
+                elif hasattr(pkt, 'icmp'): proto = 'ICMP'
+                elif hasattr(pkt, 'ip'): proto = 'IP'
+                else: 
+                    proto = next((lay.layer_name for lay in pkt.layers), "UNKNOWN")
+            
+            proto_str = str(proto).upper()
+            
+            if proto_str.endswith('_RAW'):
+                proto_str = proto_str[:-4]
+                
+            protocol_counts[proto_str] = protocol_counts.get(proto_str, 0) + 1
+                        
             src, dst = (pkt.ip.src, pkt.ip.dst) if hasattr(pkt, 'ip') else \
                          (pkt.ipv6.src, pkt.ipv6.dst) if hasattr(pkt, 'ipv6') else (None, None)
             
-            if src: src_ip_counts[src] = src_ip_counts.get(src, 0) + 1 
+            if src: src_ip_counts[src] = src_ip_counts.get(src, 0) + 1
             if dst: dst_ip_counts[dst] = dst_ip_counts.get(dst, 0) + 1
             
             sport, dport = (int(pkt.tcp.srcport), int(pkt.tcp.dstport)) if hasattr(pkt, 'tcp') else \
@@ -123,7 +136,7 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
         session.add(fail_alert)
         session.commit()
         raise
-
+    
     stream_count = 0
     for meta in streams_map.values():
         if meta.get("is_encrypted", False):
@@ -160,7 +173,6 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
         session.add(Stat(analysis_id=analysis.id, category="protocol", key=proto, count=cnt))
     for port, cnt in port_counts.items():
         session.add(Stat(analysis_id=analysis.id, category="port", key=str(port), count=cnt))
-
     for ip, cnt in src_ip_counts.items():
         session.add(IpRecord(
             analysis_id=analysis.id, 
@@ -175,7 +187,7 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
             role="DST", 
             count=cnt
         ))
-
+    
     end_time = time.perf_counter()
     analysis.status = "completed"
     analysis.total_packets = total_packets
