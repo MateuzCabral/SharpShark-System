@@ -65,7 +65,7 @@ def require_active_user(current_user: User = Depends(check_token)) -> User:
     Usada para endpoints que qualquer usuário logado E ativo pode acessar.
     """
     if not current_user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Usuário Inativo")
     return current_user
 
 
