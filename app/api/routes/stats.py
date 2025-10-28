@@ -1,10 +1,9 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 import traceback # Para log de erros
-
-from api.schemas.dependencies import get_session
+from api.schemas.dependencies import get_session, require_active_user
 import services.stats as stats_service
-from db.models import Analysis # Para verificar existência em get_stats_by_analysis
+from db.models import Analysis, User # Para verificar existência em get_stats_by_analysis
 
 # Define o roteador para a seção de Estatísticas
 stats_router = APIRouter(prefix="/stats", tags=["Stats"])
@@ -12,6 +11,7 @@ stats_router = APIRouter(prefix="/stats", tags=["Stats"])
 @stats_router.get("/")
 def list_stats_endpoint(
     category: str = Query(None, description="Filtrar estatísticas por uma categoria específica (ex: protocol, port)"),
+    current_user: User = Depends(require_active_user),
     session: Session = Depends(get_session)
 ):
     """
@@ -36,7 +36,7 @@ def list_stats_endpoint(
 
 
 @stats_router.get("/analysis/{analysis_id}")
-def stats_by_analysis_endpoint(analysis_id: str, session: Session = Depends(get_session)):
+def stats_by_analysis_endpoint(analysis_id: str, current_user: User = Depends(require_active_user), session: Session = Depends(get_session)):
     """
     Lista todas as estatísticas brutas (objetos Stat) associadas a uma análise específica.
     """
@@ -56,7 +56,7 @@ def stats_by_analysis_endpoint(analysis_id: str, session: Session = Depends(get_
 
 
 @stats_router.get("/dashboard/summary")
-def get_dashboard_summary_endpoint(session: Session = Depends(get_session)): # Nome diferente
+def get_dashboard_summary_endpoint(session: Session = Depends(get_session), current_user: User = Depends(require_active_user)): # Nome diferente
     """
     Endpoint que retorna as estatísticas agregadas para o dashboard principal.
     """
