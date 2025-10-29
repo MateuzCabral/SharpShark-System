@@ -1,3 +1,4 @@
+# app/services/ingestor.py
 import asyncio
 import os
 import traceback
@@ -11,249 +12,318 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from services.files import _create_file_sync # Reutiliza a lógica de criação de arquivo
+from threading import Timer # Para limpar _scheduled_recently
+from services.files import _create_file_sync
 from task_runner import run_analysis_task
-import services.settings as settings_service
+from services.settings import get_setting, INGEST_FOLDER_KEY, INGEST_USER_ID_KEY
 
 logger = logging.getLogger("sharpshark.ingestor")
 SessionLocal = sessionmaker(bind=db, expire_on_commit=False)
 
-INGEST_POLL_SECONDS = 15.0 # Tempo que o loop gerenciador dorme
+INGEST_POLL_SECONDS = 15.0 # Intervalo de verificação de configuração do loop principal
 
-# Thread Pool para tarefas do *Ingestor* (ler arquivo, chamar _create_file_sync)
-# É separado do Process Pool principal (que faz a análise pesada)
+# --- Constantes para Verificação ---
+STABILITY_CHECK_INTERVAL_SECONDS = 10.0 # Intervalo entre verificações de tamanho
+REQUIRED_STABLE_CHECKS = 2       # Nº de verificações consecutivas com tamanho igual para considerar estável
+MAX_VERIFICATION_DURATION_SECONDS = 1800 # Timeout de segurança (30 minutos) para a verificação
+REPROCESS_ALLOW_DELAY_SECONDS = 30.0 # Tempo para permitir que watchdog tente novamente um arquivo falho/pulado
+# --- Fim Constantes ---
+
 ingestion_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ingestor_worker")
 
+# --- IngestorEventHandler e Funções de Gerenciamento (sem alterações nesta parte) ---
 class IngestorEventHandler(FileSystemEventHandler):
-    """
-    Handler do Watchdog. É acionado quando o S.O. detecta
-    criação ou movimentação de arquivos na pasta monitorada.
-    """
+    """ Handler do Watchdog """
     def __init__(self, user_id: str, app):
         super().__init__()
-        self.user_id = user_id # O ID do usuário (definido nas Configs) a quem o arquivo será atribuído
-        self.app = app # Referência à app FastAPI (para acessar o Process Pool)
+        self.user_id = user_id
+        self.app = app
         logger.debug(f"Handler Watchdog inicializado para User: {self.user_id}")
+        self._scheduled_recently = set()
+
+    def _remove_from_scheduled(self, filepath: str):
+        """ Libera o arquivo para ser detectado novamente pelo watchdog. """
+        self._scheduled_recently.discard(filepath)
+        logger.debug(f"Watchdog: Permitindo nova detecção para {filepath}")
+
+    def _schedule_processing(self, filepath: str):
+        """ Agenda o processamento no ThreadPool, evitando duplicatas recentes. """
+        abs_path = os.path.abspath(filepath)
+        if abs_path in self._scheduled_recently:
+            logger.debug(f"Watchdog: Ignorando evento para {abs_path} (já agendado recentemente).")
+            return
+
+        logger.info(f"Watchdog (User: {self.user_id}): Ficheiro PCAP detectado: {abs_path}. Agendando worker de ingestão.")
+        self._scheduled_recently.add(abs_path)
+        ingestion_executor.submit(_run_ingestion_sync, abs_path, self.user_id, self.app)
+        Timer(REPROCESS_ALLOW_DELAY_SECONDS, self._remove_from_scheduled, [abs_path]).start()
 
     def on_created(self, event):
         """ Chamado quando um arquivo é criado. """
-        if not event.is_directory:
-            logger.debug(f"Watchdog (User: {self.user_id}): Evento 'created' detectado: {event.src_path}")
-            self.process(event.src_path)
+        if event.is_directory: return
+        filepath = event.src_path
+        logger.debug(f"Watchdog (User: {self.user_id}): Evento 'created' detectado para: {filepath}")
+        if filepath.lower().endswith((".pcap", ".pcapng")):
+            self._schedule_processing(filepath)
 
     def on_moved(self, event):
         """ Chamado quando um arquivo é movido/renomeado para a pasta. """
-        if not event.is_directory:
-            logger.debug(f"Watchdog (User: {self.user_id}): Evento 'moved' detectado: {event.dest_path}")
-            self.process(event.dest_path)
-
-    def process(self, filepath: str):
-        """
-        Filtra o evento e submete a tarefa de ingestão para o ThreadPool do Ingestor.
-        """
-        try:
-            # Verifica se é um arquivo PCAP
-            if filepath.lower().endswith((".pcap", ".pcapng")):
-                time.sleep(1.0) # Pequena espera para garantir que o arquivo terminou de ser copiado
-                logger.info(f"Watchdog (User: {self.user_id}): Ficheiro PCAP válido detectado: {filepath}. Submetendo para ingestão.")
-                # Submete a tarefa de ingestão (I/O) para o ThreadPool
-                ingestion_executor.submit(_run_ingestion_sync, filepath, self.user_id, self.app)
-            else:
-                logger.debug(f"Watchdog (User: {self.user_id}): Ignorando ficheiro não PCAP: {filepath}")
-        except Exception as e:
-            logger.error(f"Watchdog (User: {self.user_id}): Erro no handler ao processar {filepath}: {e}", exc_info=True)
-
+        if event.is_directory: return
+        filepath = event.dest_path
+        logger.debug(f"Watchdog (User: {self.user_id}): Evento 'moved' detectado para: {filepath}")
+        if filepath.lower().endswith((".pcap", ".pcapng")):
+            self._schedule_processing(filepath)
 
 async def launch_background_ingestor(app):
-    """
-    Inicia a task de background (asyncio) que gerencia o Watchdog.
-    Chamado no 'startup' do FastAPI.
-    """
+    """ Inicia a task de background que gerencia o Watchdog. """
     if hasattr(app.state, "ingestor_task") and app.state.ingestor_task and not app.state.ingestor_task.done():
         logger.info("Task gerenciadora do ingestor já está rodando.")
         return
-
     logger.info("Iniciando task gerenciadora do ingestor (Watchdog Manager)...")
-    # Inicializa o estado
     app.state.current_observer = None
     app.state.current_watch_path = None
     app.state.current_watch_user_id = None
-
     loop = asyncio.get_running_loop()
-    # Cria a task que rodará o 'run_ingestor_loop'
     app.state.ingestor_task = loop.create_task(run_ingestor_loop(app))
     logger.info("Task gerenciadora do ingestor iniciada.")
 
 
 async def stop_background_ingestor(app):
-    """
-    Para a task de background (asyncio) e o Watchdog.
-    Chamado no 'shutdown' do FastAPI.
-    """
+    """ Para a task de background e o Watchdog. """
     logger.info("Parando task gerenciadora do ingestor...")
     task = getattr(app.state, "ingestor_task", None)
-    # 1. Cancela a task asyncio
     if task and not task.done():
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            logger.info("Task gerenciadora do ingestor cancelada com sucesso.")
-        except Exception as e:
-            logger.exception(f"Erro ao aguardar cancelamento da task gerenciadora: {e}")
-    else:
-        logger.info("Task gerenciadora do ingestor não estava rodando ou já havia terminado.")
+        try: await task
+        except asyncio.CancelledError: logger.info("Task gerenciadora do ingestor cancelada com sucesso.")
+        except Exception as e: logger.exception(f"Erro ao aguardar cancelamento da task gerenciadora: {e}")
+    else: logger.info("Task gerenciadora do ingestor não estava rodando ou já havia terminado.")
 
-    # 2. Para o 'observer' (Watchdog)
     logger.info("Parando observer do Watchdog (se existir)...")
     observer = getattr(app.state, "current_observer", None)
     if observer and observer.is_alive():
         try:
             observer.stop()
-            observer.join(timeout=5.0) # Espera a thread do watchdog terminar
-            if observer.is_alive():
-                logger.warning("Timeout ao esperar observer do Watchdog parar.")
-            else:
-                logger.info("Observer do Watchdog parado com sucesso.")
-        except Exception as e:
-            logger.exception(f"Erro ao parar observer do Watchdog: {e}")
-    else:
-        logger.info("Observer do Watchdog não estava rodando.")
+            observer.join(timeout=5.0)
+            if observer.is_alive(): logger.warning("Timeout ao esperar observer do Watchdog parar.")
+            else: logger.info("Observer do Watchdog parado com sucesso.")
+        except Exception as e: logger.exception(f"Erro ao parar observer do Watchdog: {e}")
+    else: logger.info("Observer do Watchdog não estava rodando.")
 
-    # 3. Encerra o ThreadPool do Ingestor
     logger.info("Encerrando executor de ingestão (aguardando tarefas pendentes)...")
-    ingestion_executor.shutdown(wait=True)
+    ingestion_executor.shutdown(wait=True) # Espera workers terminarem
     logger.info("Executor de ingestão encerrado.")
+
+
+def _scan_and_schedule_existing_files(folder_path: str, user_id: str, app):
+    """ Verifica arquivos existentes na pasta e agenda o processamento. """
+    logger.info(f"Scanner: Verificando arquivos PCAP existentes em {folder_path}...")
+    try:
+        count = 0
+        for filename in os.listdir(folder_path):
+            if filename.lower().endswith((".pcap", ".pcapng")):
+                filepath = os.path.join(folder_path, filename)
+                # Cria um handler temporário apenas para chamar _schedule_processing
+                temp_handler = IngestorEventHandler(user_id=user_id, app=app)
+                logger.debug(f"Scanner: Encontrado arquivo existente: {filepath}. Agendando...")
+                temp_handler._schedule_processing(filepath)
+                count += 1
+        logger.info(f"Scanner: {count} arquivos existentes agendados para verificação.")
+    except FileNotFoundError:
+        logger.error(f"Scanner: Pasta não encontrada durante scan inicial: {folder_path}")
+    except OSError as e:
+        logger.error(f"Scanner: Erro OSError ao listar arquivos em {folder_path}: {e}")
+    except Exception as e:
+        logger.exception(f"Scanner: Erro inesperado durante scan inicial: {e}")
 
 
 async def run_ingestor_loop(app):
     """
-    A task de background (asyncio) que gerencia o Watchdog.
-    Ela verifica o banco de dados periodicamente para ver se as
-    configurações de ingestão mudaram.
+    Task asyncio que gerencia o Watchdog e faz scan inicial.
     """
     logger.info("Loop gerenciador do ingestor (Watchdog) iniciado.")
+    initial_scan_done_for_path = {} # Rastreia para quais pastas o scan inicial foi feito
+
     while True:
         try:
             folder_to_watch = None
             user_id_to_assign = None
-            session: Session = SessionLocal() # Cria uma sessão curta para ler configs
-
-            # 1. Lê as configurações atuais do DB
+            session: Session = SessionLocal()
             try:
-                folder_to_watch = settings_service.get_setting(session, settings_service.INGEST_FOLDER_KEY)
-                user_id_to_assign = settings_service.get_setting(session, settings_service.INGEST_USER_ID_KEY)
-            except sqlalchemy_exc.SQLAlchemyError as e:
-                logger.error(f"Loop Ingestor: Erro DB ao buscar configurações: {e}")
-            finally:
-                session.close()
+                folder_to_watch = get_setting(session, INGEST_FOLDER_KEY)
+                user_id_to_assign = get_setting(session, INGEST_USER_ID_KEY)
+            except sqlalchemy_exc.SQLAlchemyError as e: logger.error(f"Loop Ingestor: Erro DB: {e}")
+            finally: session.close()
 
             if folder_to_watch: folder_to_watch = os.path.abspath(folder_to_watch)
 
-            # Pega o estado atual do observer (salvo no 'app.state')
             observer = getattr(app.state, "current_observer", None)
             current_path = getattr(app.state, "current_watch_path", None)
             current_user = getattr(app.state, "current_watch_user_id", None)
 
-            # 2. Lógica de decisão
+            # --- Lógica Principal ---
             if folder_to_watch and user_id_to_assign:
-                # Caso A: Configs existem, mas a pasta não é válida
+                # Caso A: Pasta inválida
                 if not os.path.isdir(folder_to_watch):
-                    logger.error(f"Loop Ingestor: Pasta de ingestão configurada '{folder_to_watch}' não existe ou não é diretório. Watchdog não iniciado/parado.")
+                    logger.error(f"Loop Ingestor: Pasta '{folder_to_watch}' inválida. Watchdog parado/não iniciado.")
                     if observer and observer.is_alive():
-                        logger.info("Parando observer devido à pasta inválida...")
                         observer.stop(); observer.join()
                         app.state.current_observer = None; app.state.current_watch_path = None; app.state.current_watch_user_id = None
-                # Caso B: Configs mudaram (ou é a primeira vez)
+                        initial_scan_done_for_path.pop(folder_to_watch, None)
+                # Caso B: Configuração mudou ou primeira vez
                 elif folder_to_watch != current_path or user_id_to_assign != current_user:
-                    logger.info(f"Loop Ingestor: Configuração mudou (ou iniciando). Path: '{folder_to_watch}', User: '{user_id_to_assign}'. Reiniciando Watchdog...")
-                    if observer and observer.is_alive():
-                        observer.stop(); observer.join() # Para o antigo
+                    logger.info(f"Loop Ingestor: Config mudou/iniciando. Path: '{folder_to_watch}', User: '{user_id_to_assign}'. (Re)Iniciando Watchdog...")
+                    if observer and observer.is_alive(): observer.stop(); observer.join()
                     try:
-                        # Inicia o novo observer
                         event_handler = IngestorEventHandler(user_id=user_id_to_assign, app=app)
                         observer = Observer()
                         observer.schedule(event_handler, folder_to_watch, recursive=False)
                         observer.start()
-                        # Salva o novo estado
                         app.state.current_observer = observer
                         app.state.current_watch_path = folder_to_watch
                         app.state.current_watch_user_id = user_id_to_assign
                         logger.info(f"Watchdog iniciado e monitorando: {folder_to_watch}")
+                        # --- Scan Inicial ---
+                        if not initial_scan_done_for_path.get(folder_to_watch, False):
+                            logger.info(f"Loop Ingestor: Executando scan inicial para pasta {folder_to_watch}")
+                            _scan_and_schedule_existing_files(folder_to_watch, user_id_to_assign, app)
+                            initial_scan_done_for_path[folder_to_watch] = True
+                        else:
+                             logger.debug(f"Loop Ingestor: Scan inicial já realizado para {folder_to_watch}. Pulando.")
+                        # --- Fim Scan Inicial ---
                     except Exception as e:
-                         logger.exception(f"Loop Ingestor: Falha CRÍTICA ao iniciar Watchdog para '{folder_to_watch}': {e}")
-                         app.state.current_observer = None; app.state.current_watch_path = None; app.state.current_watch_user_id = None
-            # Caso C: Configs foram limpas (pasta ou usuário vazios)
+                        logger.exception(f"Loop Ingestor: Falha CRÍTICA ao iniciar Watchdog: {e}")
+                        app.state.current_observer = None; app.state.current_watch_path = None; app.state.current_watch_user_id = None
+                        initial_scan_done_for_path.pop(folder_to_watch, None)
+            # Caso C: Configuração desativada
             elif observer and observer.is_alive():
-                logger.info("Loop Ingestor: Configuração de ingestão removida ou incompleta. Parando Watchdog.")
+                logger.info("Loop Ingestor: Configuração desativada. Parando Watchdog.")
                 observer.stop(); observer.join()
+                previous_path = app.state.current_watch_path
                 app.state.current_observer = None; app.state.current_watch_path = None; app.state.current_watch_user_id = None
+                if previous_path: initial_scan_done_for_path.pop(previous_path, None)
 
-            # 3. Dorme antes de verificar novamente
             await asyncio.sleep(INGEST_POLL_SECONDS)
 
-        except asyncio.CancelledError:
-            logger.info("Loop gerenciador do ingestor cancelado.")
-            break
-        except Exception as e:
-            logger.exception(f"Loop Ingestor: Erro inesperado no ciclo: {e}")
-            await asyncio.sleep(INGEST_POLL_SECONDS * 2) # Espera mais se der erro
+        except asyncio.CancelledError: logger.info("Loop gerenciador do ingestor cancelado."); break
+        except Exception as e: logger.exception(f"Loop Ingestor: Erro: {e}"); await asyncio.sleep(INGEST_POLL_SECONDS * 2)
 
 
+# --- Função Worker Atualizada (Verificação Contínua com Timeout) ---
 def _run_ingestion_sync(filepath: str, user_id: str, app):
     """
-    Função worker (síncrona) executada no ThreadPool do Ingestor.
-    Ela simula um upload de API.
+    Worker que verifica estabilidade continuamente (com timeout), lê o arquivo
+    e submete para análise.
     """
-    if not os.path.isfile(filepath):
-        logger.warning(f"Ingestor Worker (User: {user_id}): Ficheiro {filepath} desapareceu antes do processamento.")
-        return
+    worker_start_time = time.time()
+    logger.info(f"Ingestor Worker (User: {user_id}): Iniciando verificação de estabilidade para {filepath}...")
 
-    logger.info(f"Ingestor Worker (User: {user_id}): Iniciando ingestão de {filepath}")
-    session: Session = SessionLocal() # Cria uma sessão DB para esta thread
-    file_processed = False
+    last_size = -1
+    stable_checks_count = 0
+    is_stable = False
+
     try:
-        # 1. Lê o arquivo do disco
-        try:
-            with open(filepath, "rb") as f:
-                file_data = f.read()
-        except OSError as e:
-            logger.error(f"Ingestor Worker (User: {user_id}): Erro OSError ao ler {filepath}: {e}")
-            return
+        # --- Loop de Verificação de Estabilidade (com timeout) ---
+        while True:
+            # Verifica timeout geral
+            current_duration = time.time() - worker_start_time
+            if current_duration > MAX_VERIFICATION_DURATION_SECONDS:
+                logger.warning(f"Ingestor Worker (User: {user_id}): Timeout ({MAX_VERIFICATION_DURATION_SECONDS}s) atingido ao verificar {filepath}. Pulando.")
+                return # Aborta por timeout
 
-        # 2. Simula um 'UploadFile' do FastAPI
-        file_wrapper = UploadFile(filename=os.path.basename(filepath), file=BytesIO(file_data))
-        
-        # 3. Chama a *mesma* função de criação/validação da API
-        new_file, analysis = _create_file_sync(session, file_wrapper, user_id)
+            current_size = -1
+            try:
+                # Verifica existência antes de getsize
+                if not os.path.exists(filepath):
+                    logger.warning(f"Ingestor Worker (User: {user_id}): Ficheiro {filepath} desapareceu durante verificação.")
+                    return # Aborta se o arquivo sumiu
+                current_size = os.path.getsize(filepath)
+            except OSError as e:
+                logger.error(f"Ingestor Worker (User: {user_id}): Erro OSError ao obter tamanho de {filepath}: {e}. Tentando novamente em {STABILITY_CHECK_INTERVAL_SECONDS}s...")
+                # Reseta contagem de estabilidade se houve erro na leitura do tamanho
+                stable_checks_count = 0
+                last_size = -1
+                time.sleep(STABILITY_CHECK_INTERVAL_SECONDS)
+                continue # Pula para a próxima iteração
 
-        file_processed = True
-        
-        # 4. Pega o Process Pool *principal* (do app.state)
-        process_pool = app.state.process_pool
-        
-        # 5. Submete a análise pesada (CPU) para o Process Pool
-        process_pool.submit(run_analysis_task, analysis_id=analysis.id, file_id=new_file.id)
-        logger.info(f"Ingestor Worker (User: {user_id}): Análise {analysis.id} (Arq: {new_file.id}) submetida ao Pool.")
-        
-        # 6. (Sucesso) Remove o arquivo original da pasta de ingestão
-        logger.info(f"Ingestor Worker (User: {user_id}): Ingestão de {filepath} bem-sucedida. Removendo original.")
-        try:
-            os.remove(filepath)
-        except OSError as e:
-             logger.warning(f"Ingestor Worker (User: {user_id}): Falha ao remover arquivo original {filepath} após ingestão: {e}")
+            logger.debug(f"Ingestor Worker: Verificando {filepath}. Tamanho: {current_size} bytes (anterior: {last_size}). Checks estáveis: {stable_checks_count}/{REQUIRED_STABLE_CHECKS}.")
 
-    except HTTPException as e:
-        # Se _create_file_sync falhar (ex: duplicado, inválido), remove o arquivo
-        if e.status_code in [400, 409, 413]: # Bad Request, Conflict, Too Large
-            logger.warning(f"Ingestor Worker (User: {user_id}): Falha ao ingerir {filepath}: {e.detail}. Removendo.")
-            try: os.remove(filepath)
-            except Exception as rm_e: logger.error(f"Ingestor Worker (User: {user_id}): Falha CRÍTICA ao remover ficheiro inválido {filepath}: {rm_e}")
-        else:
-            # Outros erros (ex: 500) - não remove o arquivo
-            logger.error(f"Ingestor Worker (User: {user_id}): HTTPException {e.status_code} ao processar {filepath}: {e.detail}. NÃO será removido.")
-    except Exception as e:
-        # Erro inesperado - não remove o arquivo
-        logger.exception(f"Ingestor Worker (User: {user_id}): Erro crítico ao processar {filepath}: {e}. NÃO será removido.")
-    finally:
-        session.close() # Fecha a sessão desta thread
+            # Compara com o tamanho anterior válido
+            if last_size != -1 and current_size == last_size:
+                stable_checks_count += 1
+            else:
+                # Se tamanho mudou (ou é a primeira leitura válida), reseta a contagem
+                stable_checks_count = 0
+
+            last_size = current_size # Atualiza o último tamanho lido com sucesso
+
+            # Verifica se atingiu o número necessário de checks estáveis E se o arquivo não está vazio
+            if stable_checks_count >= REQUIRED_STABLE_CHECKS and last_size > 0:
+                logger.info(f"Ingestor Worker (User: {user_id}): Ficheiro {filepath} considerado estável ({last_size} bytes) após {stable_checks_count+1} verificações iguais consecutivas. Iniciando ingestão...")
+                is_stable = True
+                break # Sai do loop de verificação para iniciar a ingestão
+
+            # Se ainda não está estável, espera para a próxima verificação
+            logger.debug(f"Ingestor Worker: {filepath} ainda instável ou vazio. Aguardando {STABILITY_CHECK_INTERVAL_SECONDS}s...")
+            time.sleep(STABILITY_CHECK_INTERVAL_SECONDS)
+        # --- Fim Loop de Verificação ---
+
+        # Se saiu do loop porque estabilizou (is_stable == True)
+        if is_stable and last_size > 0:
+            # --- Processo de Ingestão (mesma lógica anterior) ---
+            session: Session = SessionLocal()
+            try:
+                # 1. Lê o arquivo
+                logger.debug(f"Ingestor Worker: Lendo {last_size} bytes de {filepath}...")
+                try:
+                    with open(filepath, "rb") as f:
+                        file_data = f.read()
+                    if len(file_data) != last_size:
+                         logger.error(f"Ingestor Worker (User: {user_id}): Tamanho lido ({len(file_data)}) INCONSISTENTE com tamanho estável ({last_size}) para {filepath}! Abortando.")
+                         return
+                except OSError as e:
+                    logger.error(f"Ingestor Worker (User: {user_id}): Erro OSError ao LER {filepath} após estabilização: {e}")
+                    return
+
+                # 2. Simula UploadFile
+                logger.debug(f"Ingestor Worker: Simulando UploadFile para {filepath}...")
+                file_wrapper = UploadFile(filename=os.path.basename(filepath), file=BytesIO(file_data))
+
+                # 3. Chama _create_file_sync
+                logger.debug(f"Ingestor Worker: Chamando _create_file_sync para {filepath}...")
+                new_file, analysis = _create_file_sync(session, file_wrapper, user_id)
+                logger.info(f"Ingestor Worker: Registros DB criados para {filepath} (File ID: {new_file.id}, Analysis ID: {analysis.id}).")
+
+                # 4. Submete análise
+                logger.debug(f"Ingestor Worker: Submetendo análise {analysis.id} para o Process Pool...")
+                process_pool = app.state.process_pool
+                process_pool.submit(run_analysis_task, analysis_id=analysis.id, file_id=new_file.id)
+                logger.info(f"Ingestor Worker (User: {user_id}): Análise {analysis.id} (Arq: {new_file.id}) submetida.")
+
+                # 5. Remove arquivo original da pasta INGEST
+                logger.info(f"Ingestor Worker (User: {user_id}): Ingestão de {filepath} completa. Removendo original da pasta ingest.")
+                try:
+                    os.remove(filepath)
+                except OSError as e:
+                     logger.warning(f"Ingestor Worker (User: {user_id}): Falha ao remover {filepath} da pasta ingest após sucesso: {e}")
+
+            except HTTPException as e_sync:
+                logger.warning(f"Ingestor Worker (User: {user_id}): Falha controlada ({e_sync.status_code}: {e_sync.detail}) ao processar {filepath}.")
+                if e_sync.status_code in [400, 409, 413]:
+                    logger.info(f"Ingestor Worker: Removendo arquivo inválido/duplicado/grande da pasta ingest: {filepath}")
+                    try:
+                         if os.path.exists(filepath): os.remove(filepath)
+                    except Exception as rm_e:
+                         logger.error(f"Ingestor Worker (User: {user_id}): Falha CRÍTICA ao remover ficheiro inválido {filepath}: {rm_e}")
+
+            except Exception as e_general:
+                 logger.exception(f"Ingestor Worker (User: {user_id}): Erro crítico inesperado durante ingestão de {filepath}: {e_general}. Arquivo NÃO será removido.")
+
+            finally:
+                if 'session' in locals() and session:
+                    session.close() # Garante fechar a sessão
+
+    except Exception as e_outer:
+         # Captura erros muito iniciais (ex: no loop de verificação)
+         logger.exception(f"Ingestor Worker (User: {user_id}): Erro irrecuperável (ex: loop de verificação) processando {filepath}: {e_outer}")
+         # O Timer eventualmente limpará _scheduled_recently, permitindo nova tentativa
