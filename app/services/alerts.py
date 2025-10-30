@@ -1,10 +1,13 @@
 from sqlalchemy.orm import Session
 from db.models import Alert
 from fastapi import HTTPException
+from sqlalchemy.orm.query import Query
 
-def get_alerts(session: Session, alert_type: str = None, severity: str = None):
+def get_alerts(session: Session, alert_type: str = None, severity: str = None) -> Query:
     """
     Busca alertas no banco de dados, com filtros opcionais.
+    
+    RETORNA: O objeto Query do SQLAlchemy, não os resultados.
     """
     # Inicia a query base para a tabela Alert
     query = session.query(Alert)
@@ -16,11 +19,4 @@ def get_alerts(session: Session, alert_type: str = None, severity: str = None):
     if severity:
         query = query.filter(Alert.severity == severity)
 
-    # Executa a query
-    alerts = query.all()
-
-    # Se a query não retornar nada, levanta um erro 404
-    if not alerts:
-        raise HTTPException(status_code=404, detail="Nenhum alerta encontrado")
-
-    return alerts
+    return query.order_by(Alert.id.desc()) # Adiciona uma ordem padrão
