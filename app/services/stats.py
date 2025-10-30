@@ -1,23 +1,13 @@
-# app/services/stats.py
 from sqlalchemy.orm import Session
 from sqlalchemy import func, distinct
 from datetime import datetime, timedelta, timezone
 import traceback # Para logar erros
-
 from db.models import Stat, Analysis, Alert, IpRecord # Importar modelos
 
 def get_aggregated_stats(session: Session, category: str = None):
     """
     Busca estatísticas agregadas, agrupadas por categoria e chave.
-
-    Args:
-        session: A sessão do banco de dados.
-        category: Filtro opcional para buscar apenas uma categoria.
-
-    Returns:
-        Um dicionário onde as chaves são categorias e os valores são listas
-        de {key: str, count: int}, ou uma lista se uma categoria for especificada.
-        Retorna {} ou [] se nada for encontrado.
+    (Esta função não precisa de alteração de fuso horário)
     """
     query = session.query(
         Stat.category,
@@ -25,40 +15,26 @@ def get_aggregated_stats(session: Session, category: str = None):
         func.sum(Stat.count).label('total_count')
     )
     if category:
-        # Filtra pela categoria exata fornecida
         query = query.filter(Stat.category == category)
 
-    # Agrupa por categoria e chave, ordena para consistência
     results = query.group_by(Stat.category, Stat.key)\
                    .order_by(Stat.category, func.sum(Stat.count).desc())\
                    .all()
 
-    # Formata o resultado
     formatted_stats = {}
     for cat, key, count in results:
         if cat not in formatted_stats:
             formatted_stats[cat] = []
-        # Adiciona o resultado formatado, garantindo que count seja numérico (ou 0)
         formatted_stats[cat].append({"key": key, "count": count or 0})
 
     if category:
-        # Retorna a lista da categoria específica ou uma lista vazia
         return formatted_stats.get(category, [])
-    # Retorna o dicionário completo se nenhuma categoria foi especificada
     return formatted_stats
 
 
 def get_stats_for_analysis(session: Session, analysis_id: str) -> list[Stat]:
     """
     Busca todos os objetos Stat associados a uma análise específica.
-
-    Args:
-        session: A sessão do banco de dados.
-        analysis_id: O ID da análise.
-
-    Returns:
-        Uma lista de objetos Stat. Retorna lista vazia se a análise não tiver stats.
-        (Assume que a verificação se a análise existe é feita na camada de rota/dependência)
     """
     return session.query(Stat).filter(Stat.analysis_id == analysis_id).all()
 
@@ -66,13 +42,6 @@ def get_stats_for_analysis(session: Session, analysis_id: str) -> list[Stat]:
 def calculate_dashboard_summary(session: Session) -> dict:
     """
     Calcula as estatísticas agregadas necessárias para o dashboard principal.
-
-    Args:
-        session: A sessão do banco de dados.
-
-    Returns:
-        Um dicionário contendo as estatísticas agregadas.
-        Lança uma exceção interna em caso de erro na query.
     """
     try:
         # 1. Total de Pacotes (soma de todas as análises completas)
@@ -84,7 +53,7 @@ def calculate_dashboard_summary(session: Session) -> dict:
         # 2. Total de Alertas Registrados
         total_alerts = session.query(func.count(Alert.id)).scalar() or 0
 
-        # 3. IPs Únicos Vistos (conta IPs distintos na tabela IpRecord)
+        # 3. IPs Únicos Vistos
         unique_ips = session.query(func.count(distinct(IpRecord.ip))).scalar() or 0
 
         # 4. Análises Concluídas
@@ -93,21 +62,27 @@ def calculate_dashboard_summary(session: Session) -> dict:
                                      .scalar() or 0
 
         # 5. Tráfego por Hora (Pacotes das análises concluídas nas últimas 24h)
-        now = datetime.now(timezone.utc)
-        twenty_four_hours_ago = now - timedelta(hours=24)
+        utc_now = datetime.now(timezone.utc)
+        twenty_four_hours_ago = utc_now - timedelta(hours=24)
 
-        # Query para agrupar pacotes por slot de hora (formato HH:00)
+        # Define o fuso horário do Brasil (UTC-3)
+        br_tz = timezone(timedelta(hours=-3))
+        # Pega o 'agora' no fuso do Brasil para gerar as chaves do dicionário
+        now_in_brazil = utc_now.astimezone(br_tz) 
+
+        # Query para agrupar pacotes por slot de hora, APLICANDO O OFFSET DE -3 HORAS
         traffic_data = session.query(
-            func.strftime('%H:00', Analysis.analyzed_at).label('hour_slot'),
+            func.strftime('%H:00', Analysis.analyzed_at, '-3 hours').label('hour_slot'),
             func.sum(Analysis.total_packets).label('total_packets_in_hour')
         ).filter(
             Analysis.status == 'completed',
-            Analysis.analyzed_at >= twenty_four_hours_ago
+            Analysis.analyzed_at >= twenty_four_hours_ago # O filtro de 24h continua sendo UTC
         ).group_by('hour_slot').order_by('hour_slot').all()
 
-        # Preenche todos os slots de hora das últimas 24h com 0
-        hourly_traffic = { (now - timedelta(hours=h)).strftime("%H:00"): 0 for h in range(24) }
-        # Atualiza com os dados do banco
+        # Preenche todos os slots de hora (agora em UTC-3, pois 'now_in_brazil' está em UTC-3)
+        hourly_traffic = { (now_in_brazil - timedelta(hours=h)).strftime("%H:00"): 0 for h in range(24) }
+        
+        # Atualiza com os dados do banco (que agora também estão em UTC-3)
         for hour_slot, packets in traffic_data:
              if hour_slot in hourly_traffic:
                  hourly_traffic[hour_slot] += packets if packets else 0
@@ -120,11 +95,11 @@ def calculate_dashboard_summary(session: Session) -> dict:
 
         # 6. Distribuição de Protocolos (Top 5 + Outros)
         top_protocols = session.query(Stat.key, func.sum(Stat.count).label('total_count')) \
-                              .filter(Stat.category == 'protocol') \
-                              .group_by(Stat.key) \
-                              .order_by(func.sum(Stat.count).desc()) \
-                              .limit(5) \
-                              .all()
+                             .filter(Stat.category == 'protocol') \
+                             .group_by(Stat.key) \
+                             .order_by(func.sum(Stat.count).desc()) \
+                             .limit(5) \
+                             .all()
 
         protocol_distribution = [{"name": key, "value": count or 0} for key, count in top_protocols]
 
@@ -155,5 +130,4 @@ def calculate_dashboard_summary(session: Session) -> dict:
         # Loga o erro e relança para ser tratado pela rota (que retornará 500)
         print(f"Erro ao calcular sumário do dashboard no serviço:")
         traceback.print_exc()
-        # Não lança HTTPException aqui, deixa a camada de rota fazer isso
         raise e # Relança a exceção original
