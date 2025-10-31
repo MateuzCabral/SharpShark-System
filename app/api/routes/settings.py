@@ -16,7 +16,7 @@ def update_settings_endpoint(
     require_superuser(current_user)
     return settings_service.update_ingest_settings(
         session=session,
-        project_name_input=settings_data.ingest_project_name,
+        ingest_folder_input=settings_data.ingest_folder,
         current_user_id=current_user.id
     )
 

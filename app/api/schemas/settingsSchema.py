@@ -2,7 +2,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 class SettingUpdate(BaseModel):
-    ingest_project_name: Optional[str] = None 
+    ingest_folder: Optional[str] = None 
 
 class SettingsResponse(BaseModel):
     ingest_project_name: Optional[str] = None
