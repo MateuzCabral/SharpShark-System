@@ -5,16 +5,16 @@ import logging
 from datetime import datetime
 from typing import Tuple
 from fastapi import HTTPException, UploadFile, status, Request
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import exc as sqlalchemy_exc
-from db.models import File, Analysis, User
+from db.models import File, Analysis, User, Stream
 from api.schemas.dependencies import validate_pcap_header, calculate_file_hash
 from core.rate_limiter import upload_rate_limiter
 from core.config import UPLOAD_DIRECTORY
 from task_runner import run_analysis_task
 
 UPLOAD_DIR = UPLOAD_DIRECTORY
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024 # Limite de 100 MB
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 logger = logging.getLogger("sharpshark.files")
 
 async def create_file(session: Session, file: UploadFile, user_id: str, request: Request) -> File:
@@ -162,9 +162,27 @@ def get_file_by_hash(session: Session, file_hash: str) -> File | None:
 
 def delete_file(session: Session, file_id: str):
     logger.info(f"Iniciando deleção do ficheiro ID: {file_id}")
-    file = get_file_by_id(session, file_id)
+
+    file = session.query(File).options(
+        joinedload(File.analysis).joinedload(Analysis.streams)
+    ).filter(File.id == file_id).first()
+
+    if not file:
+        logger.warning(f"Tentativa de deletar ficheiro {file_id} falhou: Não encontrado.")
+        raise HTTPException(status_code=404, detail="Ficheiro não encontrado")
+
     file_path_to_delete = file.file_path
     filename_log = file.file_name
+    
+    stream_paths_to_delete = []
+    if file.analysis: 
+        for analysis in file.analysis:
+            if analysis.streams:
+                for stream in analysis.streams:
+                    if stream.content_path:
+                        stream_paths_to_delete.append(stream.content_path)
+    
+    logger.info(f"Ficheiro {file_id}: Coletados {len(stream_paths_to_delete)} caminhos de stream .bin para remoção.")
 
     try:
         session.delete(file)
@@ -178,20 +196,26 @@ def delete_file(session: Session, file_id: str):
     try:
         if file_path_to_delete and os.path.exists(file_path_to_delete):
             os.remove(file_path_to_delete)
-            logger.info(f"Ficheiro físico removido com sucesso: {file_path_to_delete}")
+            logger.info(f"Ficheiro físico .pcap removido com sucesso: {file_path_to_delete}")
         elif file_path_to_delete:
-            logger.warning(f"Registro DB {file_id} deletado, mas arquivo físico não encontrado: {file_path_to_delete}")
+            logger.warning(f"Registro DB {file_id} deletado, mas arquivo físico .pcap não encontrado: {file_path_to_delete}")
     except OSError as e:
-        logger.warning(f"Erro OSError ao remover ficheiro físico {file_path_to_delete} (ID DB: {file_id}): {e}")
+        logger.warning(f"Erro OSError ao remover ficheiro físico .pcap {file_path_to_delete} (ID DB: {file_id}): {e}")
     except Exception as e:
-        logger.warning(f"Erro inesperado ao remover ficheiro físico {file_path_to_delete} (ID DB: {file_id})", exc_info=True)
+        logger.warning(f"Erro inesperado ao remover ficheiro físico .pcap {file_path_to_delete} (ID DB: {file_id})", exc_info=True)
+
+    deleted_streams_count = 0
+    for path in stream_paths_to_delete:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+                deleted_streams_count += 1
+        except OSError as e:
+            logger.warning(f"Erro OSError ao remover ficheiro de stream {path} (ID DB: {file_id}): {e}")
+    logger.info(f"Removidos {deleted_streams_count}/{len(stream_paths_to_delete)} arquivos .bin de stream.")
 
 
 def get_safe_file_path(session: Session, file_id: str, current_user: User) -> Tuple[str, str]:
-    """
-    Valida as permissões e a segurança do caminho (path traversal) antes do download.
-    Retorna (caminho_seguro_absoluto, nome_original_do_arquivo)
-    """
     logger.debug(f"User {current_user.id} solicitou download do file_id {file_id}")
     
     file = get_file_by_id(session, file_id)

@@ -64,11 +64,6 @@ def download_file(
     current_user: User = Depends(require_active_user),
     session: Session = Depends(get_session)
 ):
-    """
-    Fornece o arquivo PCAP original para download.
-    Acesso restrito ao dono do arquivo ou superusuários.
-    Valida usando o 'Authorization: Bearer' header.
-    """
     safe_path, original_name = file_service.get_safe_file_path(
         session=session,
         file_id=file_id,

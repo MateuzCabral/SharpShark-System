@@ -1,10 +1,8 @@
-# app/services/analysis.py
 import os
 import asyncio
 import time
-import pyshark  # Wrapper Python para o TShark (Wireshark CLI)
+import pyshark
 from pyshark.capture.capture import TSharkCrashException
-import string
 import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import exc as sqlalchemy_exc
@@ -13,15 +11,13 @@ from db.models import Analysis, Stream, Stat, IpRecord, File, Alert
 from db.models import CustomRule
 from datetime import datetime, timezone
 from core.config import UPLOAD_DIRECTORY
-from analysis_rules import RulesEngine  # Importa o motor de regras de segurança
+from analysis_rules import RulesEngine
 
-# Configuração de diretórios e logger
 UPLOAD_DIR = UPLOAD_DIRECTORY
 STREAMS_DIR = os.path.join(UPLOAD_DIR, "streams")
 os.makedirs(STREAMS_DIR, exist_ok=True)
 logger = logging.getLogger("sharpshark.analysis")
 
-# --- Heurística (sem alterações) ---
 SUSPECT_CHARS_SET = set(
     list(range(0x00, 0x09)) + [0x0B, 0x0C] + list(range(0x0E, 0x20)) + list(range(0x80, 0x100))
 )
@@ -39,7 +35,6 @@ def is_payload_readable(payload: bytes) -> bool:
     suspect_count = sum(1 for byte in payload if byte in SUSPECT_CHARS_SET)
     suspect_percentage = (suspect_count / total_len) * 100
     return suspect_percentage <= SUSPECT_THRESHOLD_PERCENT
-# --- Fim Heurística ---
 
 def _initialize_analysis_state(session: Session, analysis_id: str) -> Tuple[RulesEngine, Dict, Dict, Dict, Dict, Dict]:
     logger.info(f"Análise {analysis_id}: Carregando regras globais...")
@@ -58,8 +53,6 @@ def _initialize_analysis_state(session: Session, analysis_id: str) -> Tuple[Rule
     port_counts: Dict[int, int] = {}
     src_ip_counts: Dict[str, int] = {}
     dst_ip_counts: Dict[str, int] = {}
-    
-    # Value do streams_map será alterado
     streams_map: Dict[str, Dict] = {}
     
     return rules_engine, protocol_counts, port_counts, src_ip_counts, dst_ip_counts, streams_map
@@ -68,9 +61,6 @@ def _process_packet_capture(
     pcap_path: str, rules_engine: RulesEngine, protocol_counts: Dict, port_counts: Dict,
     src_ip_counts: Dict, dst_ip_counts: Dict, streams_map: Dict, session: Session
 ) -> int:
-    """
-    Função principal de processamento. Lê o PCAP pacote a pacote usando PyShark.
-    """
     total_packets = 0
     analysis_id = rules_engine.analysis_id
     try:
@@ -80,48 +70,34 @@ def _process_packet_capture(
         for pkt_index, pkt in enumerate(capture):
             total_packets = pkt_index + 1
             try:
-                # 1. Processa o pacote (regras por pacote)
-                # --- INÍCIO DA ALTERAÇÃO ---
-                # Pega o 'info' primeiro, pois precisaremos dele para o streams_map
                 info = rules_engine._extract_packet_info(pkt)
-                new_alerts = rules_engine.process_packet(pkt) # 'process_packet' ainda chama _extract_packet_info internamente,
-                                                              # mas é rápido. Poderíamos refatorar para passar 'info', mas
-                                                              # vamos manter simples por enquanto.
-                # --- FIM DA ALTERAÇÃO ---
+                new_alerts = rules_engine.process_packet(pkt)
 
-                # 2. Coleta de Estatísticas (Protocolo)
-                proto_str = info['proto'] # Usar o 'info' já extraído
+                proto_str = info['proto']
                 protocol_counts[proto_str] = protocol_counts.get(proto_str, 0) + 1
 
-                # 3. Coleta de Estatísticas (IPs)
-                src, dst = info['src_ip'], info['dst_ip'] # Usar o 'info'
+                src, dst = info['src_ip'], info['dst_ip']
                 if src: src_ip_counts[src] = src_ip_counts.get(src, 0) + 1
                 if dst: dst_ip_counts[dst] = dst_ip_counts.get(dst, 0) + 1
 
-                # 4. Coleta de Estatísticas (Portas)
-                sport, dport = info['src_port'], info['dst_port'] # Usar o 'info'
+                sport, dport = info['src_port'], info['dst_port']
                 if sport: port_counts[sport] = port_counts.get(sport, 0) + 1
                 if dport: port_counts[dport] = port_counts.get(dport, 0) + 1
 
-                # 5. Lógica de Remontagem de Stream
                 stream_key = f"tcp-{pkt.tcp.stream}" if hasattr(pkt, 'tcp') and hasattr(pkt.tcp, 'stream') else \
                              f"{src}:{sport}-{dst}:{dport}" if all([src, dst, sport, dport]) else f"pkt-{total_packets}"
                 
-                # --- INÍCIO DA ALTERAÇÃO ---
-                # Inicializa o stream no mapa se for o primeiro pacote dele
                 if stream_key not in streams_map:
                     streams_map[stream_key] = {
                         "packets": [], 
                         "stream_number": len(streams_map) + 1, 
                         "is_encrypted": False,
-                        # Adiciona os metadados do primeiro pacote
                         "src_ip": src,
                         "dst_ip": dst,
                         "src_port": sport,
                         "dst_port": dport,
                         "proto": info['proto']
                     }
-                # --- FIM DA ALTERAÇÃO ---
                 
                 if pkt.highest_layer == "TLS": streams_map[stream_key]["is_encrypted"] = True
                 
@@ -129,7 +105,7 @@ def _process_packet_capture(
                     if "pending_alerts" not in streams_map[stream_key]: streams_map[stream_key]["pending_alerts"] = []
                     streams_map[stream_key]["pending_alerts"].extend(new_alerts)
                 
-                payload_bytes = info['payload'] # Usar o 'info'
+                payload_bytes = info['payload']
                 
                 streams_map[stream_key]["packets"].append({"payload": payload_bytes})
 
@@ -162,14 +138,7 @@ def _process_packet_capture(
 
     return total_packets
 
-# --- INÍCIO DA ALTERAÇÃO ---
-# A função agora aceita 'rules_engine' como argumento
 def _save_analysis_streams(session: Session, analysis_id: str, streams_map: Dict, rules_engine: RulesEngine) -> int:
-# --- FIM DA ALTERAÇÃO ---
-    """
-    Itera sobre os streams remontados, salva o payload em arquivos .bin
-    e cria os registros de Stream e Alert no banco de dados.
-    """
     stream_count = 0
     logger.info(f"Análise {analysis_id}: Iniciando salvamento de {len(streams_map)} streams potenciais...")
     processed_streams = 0
@@ -186,30 +155,22 @@ def _save_analysis_streams(session: Session, analysis_id: str, streams_map: Dict
         full_payload = b"".join(p["payload"] for p in meta["packets"] if p.get("payload"))
         
         if not full_payload or not is_payload_readable(full_payload): continue
-
-        # --- INÍCIO DA ALTERAÇÃO: ANÁLISE DE STREAM COMPLETO ---
         
-        # Alertas que vieram da análise por-pacote
         packet_based_alerts = meta.get("pending_alerts", [])
-        
-        # Agora, rodamos as regras de payload no stream COMPLETO
+
         stream_based_alerts = []
         try:
-            # Passamos o payload E os metadados (IPs, portas) do stream
             stream_based_alerts = rules_engine.process_stream(
                 full_payload=full_payload,
-                stream_meta=meta # 'meta' agora contém src_ip, dst_ip, etc.
+                stream_meta=meta
             )
             if stream_based_alerts:
                 logger.info(f"Análise {analysis_id}: Nov(o/s) {len(stream_based_alerts)} alerta(s) encontrado(s) na análise do stream {stream_number_log}")
         except Exception as e_rule_stream:
             logger.warning(f"Análise {analysis_id}: Erro ao rodar regras de stream no stream {stream_number_log}: {e_rule_stream}")
         
-        # Combina as duas listas de alertas
         all_alerts_for_this_stream = packet_based_alerts + stream_based_alerts
         
-        # --- FIM DA ALTERAÇÃO ---
-
         final_stream_path = os.path.join(STREAMS_DIR, f"{analysis_id}_stream_{stream_count + 1}.bin")
 
         try:
@@ -230,13 +191,10 @@ def _save_analysis_streams(session: Session, analysis_id: str, streams_map: Dict
             session.add(new_stream)
             session.flush()
 
-            # --- INÍCIO DA ALTERAÇÃO ---
-            # Associa TODOS os alertas (baseados em pacote E stream)
             if all_alerts_for_this_stream:
                 for alert in all_alerts_for_this_stream:
-                    alert.stream_id = new_stream.id # Associa o ID do stream
+                    alert.stream_id = new_stream.id
                     session.add(alert)
-            # --- FIM DA ALTERAÇÃO ---
 
             stream_count += 1
 
@@ -259,11 +217,7 @@ def _save_analysis_streams(session: Session, analysis_id: str, streams_map: Dict
     logger.info(f"Análise {analysis_id}: Salvamento de streams concluído. {stream_count} streams salvos.")
     return stream_count
 
-# (O restante do arquivo _save_analysis_stats, _save_analysis_ip_records, etc. não muda)
-# ... (código inalterado) ...
-
 def _save_analysis_stats(session: Session, analysis_id: str, protocol_counts: Dict, port_counts: Dict):
-    """ Salva as estatísticas (Protocolos, Portas) no banco de dados. """
     logger.info(f"Análise {analysis_id}: Adicionando estatísticas à sessão...")
     try:
         for proto, cnt in protocol_counts.items():
@@ -275,7 +229,6 @@ def _save_analysis_stats(session: Session, analysis_id: str, protocol_counts: Di
         logger.exception(f"Análise {analysis_id}: Erro inesperado ao preparar stats: {e}")
 
 def _save_analysis_ip_records(session: Session, analysis_id: str, src_ip_counts: Dict, dst_ip_counts: Dict):
-    """ Salva os registros de IP (Origem, Destino) no banco de dados. """
     logger.info(f"Análise {analysis_id}: Adicionando registros de IP à sessão...")
     try:
         for ip, cnt in src_ip_counts.items():
@@ -287,7 +240,6 @@ def _save_analysis_ip_records(session: Session, analysis_id: str, src_ip_counts:
         logger.exception(f"Análise {analysis_id}: Erro inesperado ao preparar IP records: {e}")
 
 def _finalize_analysis(session: Session, analysis: Analysis, total_packets: int, stream_count: int, start_time: float):
-    """ Atualiza o registro principal da Análise com os totais e status 'completed'. """
     end_time = time.perf_counter()
     analysis.status = "completed"
     analysis.total_packets = total_packets
@@ -297,9 +249,6 @@ def _finalize_analysis(session: Session, analysis: Analysis, total_packets: int,
     logger.info(f"Análise {analysis.id}: Finalizada com status '{analysis.status}'. Duração: {analysis.duration}s. Pacotes: {total_packets}. Streams Salvos: {stream_count}.")
 
 def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis:
-    """
-    Função orquestradora principal para a análise de um arquivo.
-    """
     try: asyncio.get_running_loop()
     except RuntimeError: asyncio.set_event_loop(asyncio.new_event_loop())
 
@@ -315,25 +264,18 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
         logger.warning(f"Análise {analysis_id}: Status inesperado '{analysis.status}' ao iniciar. Deveria ser 'in_progress'.")
     
     try:
-        # 1. Preparação
         rules_engine, protocol_counts, port_counts, src_ip_counts, dst_ip_counts, streams_map = \
             _initialize_analysis_state(session, analysis_id)
 
-        # 2. Processamento (Leitura do PCAP)
         total_packets = _process_packet_capture(
             pcap_path, rules_engine, protocol_counts, port_counts,
             src_ip_counts, dst_ip_counts, streams_map, session
         )
 
-        # 3. Salvamento (Streams, Stats, IPs)
-        # --- INÍCIO DA ALTERAÇÃO ---
-        # Passa o 'rules_engine' para a função de salvar streams
         stream_count = _save_analysis_streams(session, analysis_id, streams_map, rules_engine)
-        # --- FIM DA ALTERAÇÃO ---
         _save_analysis_stats(session, analysis_id, protocol_counts, port_counts)
         _save_analysis_ip_records(session, analysis_id, src_ip_counts, dst_ip_counts)
         
-        # 4. Finalização
         _finalize_analysis(session, analysis, total_packets, stream_count, start_time)
 
         session.commit()
@@ -351,14 +293,7 @@ def analyze_file(session: Session, file_obj: File, analysis_id: str) -> Analysis
         raise
     return analysis
 
-# (Funções de emergência _mark_analysis_status_in_new_session e _save_error_alert_in_new_session permanecem inalteradas)
-# ... (código inalterado) ...
-
 def _mark_analysis_status_in_new_session(analysis_id: str, status: str):
-    """
-    Função de emergência. Cria uma nova sessão de DB isolada
-    apenas para atualizar o STATUS de uma análise (ex: para 'failed').
-    """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     try:
@@ -386,10 +321,6 @@ def _mark_analysis_status_in_new_session(analysis_id: str, status: str):
 
 
 def _save_error_alert_in_new_session(analysis_id: str, evidence: str):
-    """
-    Função de emergência. Cria uma nova sessão de DB isolada
-    apenas para salvar um ALERTA de erro crítico.
-    """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     try:

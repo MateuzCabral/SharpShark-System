@@ -3,32 +3,26 @@ from sqlalchemy.orm import Session
 from sqlalchemy import exc as sqlalchemy_exc
 from fastapi import HTTPException, status
 from db.models import User
-from core.security import argon_context # Importa o hasher de senha
+from core.security import argon_context
 from api.schemas.userSchema import UserCreate, UserUpdate
 from typing import Optional
 
 logger = logging.getLogger("sharpshark.users")
 
 def create_user(session: Session, user_schema: UserCreate) -> User:
-    """
-    Cria um novo usuário no banco de dados.
-    """
     logger.info(f"Tentando criar usuário: {user_schema.name}")
     
-    # 1. Verifica se o nome de usuário já existe
     existing_user = find_user_by_name(user_schema.name, session)
     if existing_user:
         logger.warning(f"Tentativa de criar usuário já existente: {user_schema.name}")
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Nome de usuário já cadastrado")
 
     try:
-        # 2. Cria o hash da senha
         hashed = argon_context.hash(user_schema.password)
         
-        # 3. Cria o objeto User
         new_user = User(
             name=user_schema.name,
-            password=hashed, # Salva o HASH, não a senha
+            password=hashed,
             is_active=user_schema.is_active,
             is_superuser=user_schema.is_superuser
         )
@@ -48,11 +42,9 @@ def create_user(session: Session, user_schema: UserCreate) -> User:
 
 
 def get_users_query(session: Session):
-    """ Retorna o objeto Query para usuários (usado para paginação). """
     return session.query(User)
 
 def get_user_by_id(session: Session, user_id: str) -> User:
-    """ Busca um usuário pelo ID. Falha com 404 se não encontrado. """
     user = session.query(User).filter(User.id == user_id).first()
     if not user:
         logger.info(f"Tentativa de acesso a usuário não existente: ID {user_id}")
@@ -60,22 +52,16 @@ def get_user_by_id(session: Session, user_id: str) -> User:
     return user
 
 def find_user_by_name(name: str, session: Session) -> Optional[User]:
-    """ Busca um usuário pelo nome (usado para login e verificação de duplicados). """
     return session.query(User).filter(User.name == name).first()
 
 def update_user(session: Session, user_id: str, user_update: UserUpdate) -> User:
-    """
-    Atualiza um usuário existente (nome, senha, status).
-    """
     logger.info(f"Tentando atualizar usuário ID: {user_id}")
-    user = get_user_by_id(session, user_id) # Busca (ou falha com 404)
+    user = get_user_by_id(session, user_id)
 
-    updated_fields = [] # Para logging
+    updated_fields = []
 
     try:
-        # Atualiza o nome (se fornecido e diferente)
         if user_update.name and user_update.name != user.name:
-            # Verifica se o *novo* nome já está em uso
             existing_user = find_user_by_name(user_update.name, session)
             if existing_user:
                 logger.warning(f"Tentativa de atualizar user {user_id} falhou: nome '{user_update.name}' já existe (user {existing_user.id}).")
@@ -83,17 +69,14 @@ def update_user(session: Session, user_id: str, user_update: UserUpdate) -> User
             user.name = user_update.name
             updated_fields.append("name")
 
-        # Atualiza a senha (se fornecida)
         if user_update.password:
-            user.password = argon_context.hash(user_update.password) # Gera novo hash
+            user.password = argon_context.hash(user_update.password)
             updated_fields.append("password")
 
-        # Atualiza o status 'active' (se fornecido e diferente)
         if user_update.is_active is not None and user_update.is_active != user.is_active:
             user.is_active = user_update.is_active
             updated_fields.append(f"is_active={user.is_active}")
 
-        # Atualiza o status 'superuser' (se fornecido e diferente)
         if user_update.is_superuser is not None and user_update.is_superuser != user.is_superuser:
             user.is_superuser = user_update.is_superuser
             updated_fields.append(f"is_superuser={user.is_superuser}")
@@ -117,16 +100,14 @@ def update_user(session: Session, user_id: str, user_update: UserUpdate) -> User
 
 
 def delete_user(session: Session, user_id: str):
-    """ Deleta um usuário. """
     logger.info(f"Tentando deletar usuário ID: {user_id}")
-    user = get_user_by_id(session, user_id) # Busca (ou falha com 404)
+    user = get_user_by_id(session, user_id)
     user_name_log = user.name
     try:
         session.delete(user)
         session.commit()
         logger.info(f"Usuário '{user_name_log}' (ID: {user_id}) deletado com sucesso.")
     except sqlalchemy_exc.SQLAlchemyError as e:
-        # (Nota: Pode falhar se houver restrições de FK não configuradas com cascade)
         session.rollback()
         logger.error(f"Erro DB ao deletar usuário '{user_name_log}' (ID: {user_id}): {e}")
         raise HTTPException(status_code=500, detail="Erro interno ao deletar usuário.")

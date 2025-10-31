@@ -1,108 +1,70 @@
-# app/analysis_rules.py
-import re
 from collections import defaultdict
 from db.models import Alert
-from urllib.parse import unquote_plus # Para decodificar URLs
+from urllib.parse import unquote_plus
 import logging
 
-# Limites para detecção de regras
-PORT_SCAN_THRESHOLD = 10     # Nº de portas diferentes (SYN) para disparar alerta de Port Scan
-BRUTE_FORCE_THRESHOLD = 10 # Nº de falhas de login para disparar alerta de Brute Force
+PORT_SCAN_THRESHOLD = 10
+BRUTE_FORCE_THRESHOLD = 10
 
 logger = logging.getLogger("sharpshark.rules_engine")
 
 class RulesEngine:
-    """
-    Motor de regras de detecção.
-    Esta classe é instanciada para *cada* análise e mantém o estado
-    (trackers) durante o processamento dos pacotes.
-    """
     def __init__(self, analysis_id: str, custom_payload_rules: list = [], custom_port_rules: list = []):
         self.analysis_id = analysis_id
-        
-        # --- Trackers de Estado (para evitar alertas duplicados) ---
         self.custom_port_tracker = set()
-        # ESTE TRACKER É COMPARTILHADO ENTRE PACOTE E STREAM
         self.custom_payload_tracker = set()
         self.port_scan_tracker = defaultdict(lambda: defaultdict(set))
         self.bruteforce_tracker = defaultdict(int)
         self.bruteforce_alerted = set()
-        
-        # --- Regras Customizadas ---
         self.custom_payload_rules = custom_payload_rules
         self.custom_port_rules_map = {}
         for rule in custom_port_rules:
             try:
                 self.custom_port_rules_map[int(rule.value)] = rule
             except:
-                pass # Ignora regras de porta malformadas (valor não-int)
-
-    # --- INÍCIO DA ALTERAÇÃO: MÉTODO 'process_stream' ATUALIZADO ---
+                pass
 
     def process_stream(self, full_payload: bytes, stream_meta: dict) -> list[Alert]:
-        """
-        Regra: Detecta uma string/assinatura customizada no PAYLOAD COMPLETO DO STREAM.
-        Recebe 'stream_meta' contendo IPs/Portas do primeiro pacote.
-        """
         alerts = []
         if not full_payload or not self.custom_payload_rules:
             return alerts
 
-        # Tenta decodificar o payload completo
         try:
             decoded_payload = full_payload.decode('utf-8', errors='ignore').lower()
         except Exception:
-            return alerts # Não é um payload decodificável
+            return alerts
 
-        # Extrai info dos metadados do stream (armazenados do primeiro pacote)
         src_ip = stream_meta.get("src_ip")
         dst_ip = stream_meta.get("dst_ip")
         dst_port = stream_meta.get("dst_port")
-        # Pega o protocolo original (ex: TCP) e formata
         proto_original = stream_meta.get("proto", "N/A")
-        proto_display = f"Stream ({proto_original})" # Sua sugestão! Ex: "Stream (TCP)"
+        proto_display = f"Stream ({proto_original})"
 
         for rule in self.custom_payload_rules:
             try:
                 if rule.value.lower() in decoded_payload:
-                    # A chave do tracker (src_ip, dst_ip, rule.id) é a mesma
-                    # usada na verificação por pacote.
                     tracker_key = (src_ip, dst_ip, rule.id)
-
-                    # *** ESTA É A CORREÇÃO DE DUPLICIDADE ***
-                    # Se a análise por PACOTE (em _rule_detect_custom_payload)
-                    # já encontrou essa regra para este fluxo, não adiciona de novo.
                     if tracker_key not in self.custom_payload_tracker:
                         alerts.append(Alert(
                             analysis_id=self.analysis_id, 
                             alert_type=rule.alert_type, 
                             severity=rule.severity,
-                            src_ip=src_ip,     # <-- Corrigido
-                            dst_ip=dst_ip,     # <-- Corrigido
-                            port=dst_port,   # <-- Corrigido
-                            protocol=proto_display, # <-- Corrigido
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            port=dst_port,
+                            protocol=proto_display,
                             evidence=f"Assinatura de stream (Regra: {rule.name}) encontrada: '{rule.value}'"
                         ))
-                        # Adiciona ao tracker para evitar duplicatas
                         self.custom_payload_tracker.add(tracker_key)
             except Exception as e_rule:
                 logger.warning(f"Análise {self.analysis_id}: Erro ao processar regra de stream '{rule.name}': {e_rule}")
         
         return alerts
-
-    # --- FIM DA ALTERAÇÃO ---
-
     def process_packet(self, pkt) -> list[Alert]:
-        """
-        Ponto de entrada principal. Processa um único pacote
-        e retorna uma lista de novos Alertas (se houver).
-        """
         alerts = []
         
-        # 1. Normaliza as informações do pacote
         info = self._extract_packet_info(pkt)
 
-        # 2. Tenta decodificar o payload
         if info['payload']:
             try:
                 if info.get('dst_port') in [80, 443, 8080] or info.get('src_port') in [80, 443, 8080]:
@@ -114,7 +76,6 @@ class RulesEngine:
         else:
             info['decoded_payload'] = None
 
-        # 3. Executa todas as regras
         alerts.extend(self._rule_detect_custom_port(info))
         alerts.extend(self._rule_detect_custom_payload(info))
         alerts.extend(self._rule_detect_port_scan(info, pkt))
@@ -123,10 +84,6 @@ class RulesEngine:
         return alerts
 
     def _extract_packet_info(self, pkt) -> dict:
-        """
-        Helper para extrair e normalizar dados do objeto PyShark 'pkt'
-        em um dicionário simples.
-        """
         info = {
             "src_ip": None, "dst_ip": None,
             "src_port": None, "dst_port": None,
@@ -195,7 +152,6 @@ class RulesEngine:
         return alerts
 
     def _rule_detect_custom_payload(self, info: dict) -> list[Alert]:
-        """ Regra: Detecta uma string/assinatura customizada no payload POR PACOTE. """
         alerts = []
         if not info['decoded_payload'] or not self.custom_payload_rules: return alerts
         
@@ -206,7 +162,7 @@ class RulesEngine:
                     alerts.append(Alert(
                         analysis_id=self.analysis_id, alert_type=rule.alert_type, severity=rule.severity,
                         src_ip=info['src_ip'], dst_ip=info['dst_ip'], port=info.get('dst_port'),
-                        protocol=info['proto'], # Protocolo original do pacote
+                        protocol=info['proto'],
                         evidence=f"Assinatura de payload (por pacote) (Regra: {rule.name})"
                     ))
                     self.custom_payload_tracker.add(tracker_key)
