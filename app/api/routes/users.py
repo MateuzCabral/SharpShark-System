@@ -12,10 +12,10 @@ users_router = APIRouter(prefix="/users", tags=["users"])
 @users_router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 def register(
     user_schema: UserCreate,
-    current_user: User = Depends(check_token),
+    
     session: Session = Depends(get_session)
 ):
-    require_superuser(current_user)
+    
     return user_service.create_user(session, user_schema)
 
 @users_router.get("/", response_model=Page[UserRead])

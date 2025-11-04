@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse
 from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlalchemy import paginate
 from sqlalchemy.orm import Session, joinedload
-from api.schemas.dependencies import get_session, check_token
+from api.schemas.dependencies import get_session, require_active_user
 from api.schemas.analysisSchema import AnalysisRead, AlertRead, IpRecordRead
 from db.models import Analysis, Alert, IpRecord
 from db.models import File, User, Stream
@@ -17,19 +17,17 @@ MAX_STREAM_VIEW_SIZE_BYTES = 5 * 1024 * 1024
 @analyses_router.get("/", response_model=Page[AnalysisRead])
 def list_analyses(
     params: Params = Depends(),
-    current_user: User = Depends(check_token), 
+    current_user: User = Depends(require_active_user), 
     session: Session = Depends(get_session)
 ):
     query = session.query(Analysis)
-    if not current_user.is_superuser:
-        query = query.join(File).filter(File.user_id == current_user.id)
     query = query.options(joinedload(Analysis.file))
     return paginate(query.order_by(Analysis.analyzed_at.desc()), params)
 
 @analyses_router.get("/{analysis_id}", response_model=AnalysisRead)
 def get_analysis(
     analysis_id: str, 
-    current_user: User = Depends(check_token), 
+    current_user: User = Depends(require_active_user), 
     session: Session = Depends(get_session)
 ):
     analysis = session.query(Analysis).options(
@@ -40,33 +38,18 @@ def get_analysis(
     if not analysis:
         raise HTTPException(status_code=404, detail="Análise não encontrada")
     
-    if not current_user.is_superuser:
-        if analysis.file_id:
-            if not analysis.file or analysis.file.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Sem permissão para acessar esta análise")
-        else:
-            f = session.query(File).filter(File.id == analysis.file_id).first()
-            if not f or f.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Sem permissão para acessar esta análise")
-
     return analysis
 
 @analyses_router.get("/{analysis_id}/alerts", response_model=Page[AlertRead])
 def list_analysis_alerts(
     analysis_id: str, 
     params: Params = Depends(),
-    current_user: User = Depends(check_token), 
+    current_user: User = Depends(require_active_user), 
     session: Session = Depends(get_session)
 ):
     analysis = session.query(Analysis).filter(Analysis.id == analysis_id).first()
     if not analysis:
         raise HTTPException(status_code=404, detail="Análise não encontrada")
-
-    if not current_user.is_superuser:
-        f = session.query(File).filter(File.id == analysis.file_id).first()
-        if not f or f.user_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Sem permissão para acessar esta análise")
-    
     query = session.query(Alert).filter(Alert.analysis_id == analysis_id).order_by(Alert.id.desc())
     return paginate(query, params)
 
@@ -75,17 +58,12 @@ def list_analysis_ips(
     analysis_id: str, 
     params: Params = Depends(),
     role: str = Query(None, description="Filtrar por 'SRC' ou 'DST'"),
-    current_user: User = Depends(check_token), 
+    current_user: User = Depends(require_active_user), 
     session: Session = Depends(get_session)
 ):
     analysis = session.query(Analysis).filter(Analysis.id == analysis_id).first()
     if not analysis:
-        raise HTTPException(status_code=404, detail="Análise não encontrada")
-
-    if not current_user.is_superuser:
-        f = session.query(File).filter(File.id == analysis.file_id).first()
-        if not f or f.user_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Sem permissão para acessar esta análise")
+        raise HTTPException(status_code=404, detail="Análise não encontrada")  
     query = session.query(IpRecord).filter(IpRecord.analysis_id == analysis_id)
     
     if role and role.upper() in ["SRC", "DST"]:
@@ -98,20 +76,12 @@ def list_analysis_ips(
 @analyses_router.get("/stream/{stream_id}")
 def get_stream_content(
     stream_id: str, 
-    current_user: User = Depends(check_token), 
+    current_user: User = Depends(require_active_user), 
     session: Session = Depends(get_session)
-):
+):    
     stream = session.query(Stream).filter(Stream.id == stream_id).first()
     if not stream:
         raise HTTPException(status_code=404, detail="Stream não encontrado")
-
-    try:
-        owner_id = stream.analysis.file.user_id
-    except AttributeError:
-        raise HTTPException(status_code=404, detail="Análise ou ficheiro associado ao stream não encontrado")
-
-    if not current_user.is_superuser and owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Sem permissão para acessar este stream")
 
     file_path_from_db = stream.content_path
     file_path_resolved = os.path.abspath(file_path_from_db)

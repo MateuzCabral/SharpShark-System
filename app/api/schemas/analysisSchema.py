@@ -5,7 +5,8 @@ from api.schemas.fileSchema import FileReadSimple
 
 class AlertRead(BaseModel):
     id: str
-    stream_id: Optional[str] = None 
+    stream_id: Optional[str] = None
+    analysis_id: str
     alert_type: str
     severity: str
     src_ip: Optional[str]
