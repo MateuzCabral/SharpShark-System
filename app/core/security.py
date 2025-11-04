@@ -9,7 +9,7 @@ load_dotenv()
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-EXPIRE_MINUTES = int(os.getenv("EXPIRE_MINUTES", 1440))
+EXPIRE_MINUTES = int(os.getenv("EXPIRE_MINUTES") or 1440)
 
 argon_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
