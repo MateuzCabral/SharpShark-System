@@ -7,7 +7,7 @@ from db.models import Setting, User
 from services.users import get_user_by_id
 from api.schemas.settingsSchema import SettingsResponse
 from typing import List, Optional
-from core.config import INGEST_BASE_DIRECTORY
+from core.config import INGEST_BASE_DIRECTORY 
 
 logger = logging.getLogger("sharpshark.settings")
 
@@ -19,7 +19,6 @@ def _is_safe_path_component(component: str) -> bool:
     if not component:
         return False
     normalized = os.path.normpath(component)
-    
     if os.path.isabs(normalized):
         return False
     if ".." in normalized.split(os.sep):
@@ -28,7 +27,6 @@ def _is_safe_path_component(component: str) -> bool:
         return False
     if normalized == "." or normalized == "":
         return False
-        
     return True
 
 def get_current_settings(session: Session) -> SettingsResponse:
@@ -60,7 +58,6 @@ def get_current_settings(session: Session) -> SettingsResponse:
         )
         logger.debug(f"Configurações encontradas: {response.model_dump()}")
         return response
-
     except sqlalchemy_exc.SQLAlchemyError as e:
         logger.error(f"Erro DB ao buscar configurações de ingestão: {e}")
         raise HTTPException(status_code=500, detail="Erro ao buscar configurações do banco de dados.")
@@ -102,18 +99,18 @@ def update_ingest_settings(session: Session, ingest_folder_input: Optional[str],
         
         try:
             if not os.path.exists(full_path_to_check):
-                logger.warning(f"Admin {current_user_id}: Caminho de ingestão não existe (dentro do container): '{full_path_to_check}'")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Pasta não encontrada no servidor: '{project_name}'. Crie-a dentro da pasta 'Captures' e tente novamente."
-                )
+                logger.info(f"Admin {current_user_id}: Pasta '{full_path_to_check}' não existe. Criando...")
+                os.makedirs(full_path_to_check, exist_ok=True)
+                logger.info(f"Pasta '{full_path_to_check}' criada com sucesso no container (e no host).")
+
             if not os.path.isdir(full_path_to_check):
-                raise HTTPException(status_code=400, detail="O caminho fornecido é um arquivo, não uma pasta.")
-            if not os.access(full_path_to_check, os.R_OK):
-                raise HTTPException(status_code=403, detail="Permissão negada. O servidor não pode ler essa pasta.")
+                raise HTTPException(status_code=400, detail="O caminho é um arquivo, não uma pasta.")
+            if not os.access(full_path_to_check, os.R_OK) or not os.access(full_path_to_check, os.W_OK):
+                raise HTTPException(status_code=403, detail="Permissão negada. O servidor não pode ler/escrever nessa pasta.")
+                
         except OSError as e:
-            logger.error(f"Admin {current_user_id}: Erro OSError ao validar o caminho {full_path_to_check}: {e}")
-            raise HTTPException(status_code=500, detail=f"Erro no servidor ao tentar acessar o caminho: {e}")
+            logger.error(f"Admin {current_user_id}: Erro OSError ao validar/criar o caminho {full_path_to_check}: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro no servidor ao tentar acessar ou criar o caminho: {e}")
         
         logger.info(f"Admin {current_user_id}: Caminho de ingestão validado com sucesso: {full_path_to_check}")
         project_name_to_save = project_name
