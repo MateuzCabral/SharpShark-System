@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, model_validator
-from typing import Literal
+from typing import Literal, Optional
 
 SeverityType = Literal["low", "medium", "high", "critical"]
 RuleType = Literal["payload", "port"]
@@ -32,6 +32,13 @@ class CustomRuleBase(BaseModel):
 
 class CustomRuleCreate(CustomRuleBase):
     pass
+
+class CustomRuleUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=3, max_length=100)
+    rule_type: Optional[RuleType] = None
+    value: Optional[str] = Field(None, min_length=1, max_length=1000)
+    alert_type: Optional[str] = Field(None, min_length=3, max_length=50)
+    severity: Optional[SeverityType] = None
 
 class CustomRuleRead(CustomRuleBase):
     id: str

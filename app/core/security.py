@@ -8,8 +8,15 @@ from jose import jwt
 load_dotenv()
 
 SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ALGORITHM = os.getenv("ALGORITHM") or "HS256"
 EXPIRE_MINUTES = int(os.getenv("EXPIRE_MINUTES") or 1440)
+
+if not SECRET_KEY:
+    print("*" * 50)
+    print("ERRO FATAL: SECRET_KEY não definida no arquivo .env")
+    print("Por favor, copie .env-example para .env e gere uma chave.")
+    print("*" * 50)
+    raise ValueError("Missing SECRET_KEY environment variable")
 
 argon_context = CryptContext(schemes=["argon2"], deprecated="auto")
 

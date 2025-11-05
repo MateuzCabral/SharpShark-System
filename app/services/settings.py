@@ -7,12 +7,29 @@ from db.models import Setting, User
 from services.users import get_user_by_id
 from api.schemas.settingsSchema import SettingsResponse
 from typing import List, Optional
+from core.config import INGEST_BASE_DIRECTORY
 
 logger = logging.getLogger("sharpshark.settings")
 
 INGEST_FOLDER_KEY = "INGEST_FOLDER"
 INGEST_USER_ID_KEY = "INGEST_USER_ID"
 INGEST_PROJECT_NAME_KEY = "INGEST_PROJECT_NAME"
+
+def _is_safe_path_component(component: str) -> bool:
+    if not component:
+        return False
+    normalized = os.path.normpath(component)
+    
+    if os.path.isabs(normalized):
+        return False
+    if ".." in normalized.split(os.sep):
+        return False
+    if os.path.dirname(normalized) and os.path.dirname(normalized) != '':
+        return False
+    if normalized == "." or normalized == "":
+        return False
+        
+    return True
 
 def get_current_settings(session: Session) -> SettingsResponse:
     logger.debug("Buscando configurações atuais de ingestão...")
@@ -68,58 +85,46 @@ def get_all_settings(session: Session) -> List[Setting]:
     return session.query(Setting).all()
 
 def update_ingest_settings(session: Session, ingest_folder_input: Optional[str], current_user_id: str) -> SettingsResponse:
-    folder_path = ingest_folder_input.strip() if ingest_folder_input else ""
-    logger.info(f"Admin {current_user_id}: Atualizando configurações de ingestão. Caminho: '{folder_path}'")
+    project_name = ingest_folder_input.strip() if ingest_folder_input else ""
+    logger.info(f"Admin {current_user_id}: Atualizando configurações de ingestão. Projeto: '{project_name}'")
 
-    folder_path_to_save = ""
-    user_id_to_save = ""
     project_name_to_save = ""
 
-    if folder_path:
-        if not os.path.isabs(folder_path):
-            logger.warning(f"Admin {current_user_id}: Caminho de ingestão rejeitado. Não é um caminho absoluto: '{folder_path}'")
+    if project_name:
+        if not _is_safe_path_component(project_name):
+            logger.warning(f"Admin {current_user_id}: Nome de projeto rejeitado. Contém caracteres inválidos (.. / \): '{project_name}'")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Caminho inválido. O caminho da pasta deve ser absoluto (ex: /mnt/capturas/ ou C:\\Users\\...)."
+                detail="Nome do projeto inválido. Use apenas um nome simples, sem barras (/) ou (..)."
             )
 
-        try:
-            if not os.path.exists(folder_path):
-                logger.warning(f"Admin {current_user_id}: Caminho de ingestão rejeitado. O caminho não existe: '{folder_path}'")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Caminho não encontrado no servidor: '{folder_path}'. Verifique o caminho ou crie o diretório."
-                )
-            if not os.path.isdir(folder_path):
-                logger.warning(f"Admin {current_user_id}: Caminho de ingestão rejeitado. O caminho é um arquivo, não um diretório: '{folder_path}'")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Caminho inválido. O caminho fornecido é um arquivo, não uma pasta: '{folder_path}'."
-                )
-            if not os.access(folder_path, os.R_OK):
-                 logger.error(f"Admin {current_user_id}: Permissão negada. O servidor não pode ler o diretório: '{folder_path}'")
-                 raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Permissão negada. O servidor não pode ler o diretório: '{folder_path}'."
-                )
-        except OSError as e:
-            logger.error(f"Admin {current_user_id}: Erro OSError ao validar o caminho {folder_path}: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Erro no servidor ao tentar acessar o caminho: {e}"
-            )
+        full_path_to_check = os.path.join(INGEST_BASE_DIRECTORY, project_name)
         
-        logger.info(f"Admin {current_user_id}: Caminho de ingestão validado com sucesso: {folder_path}")
-        folder_path_to_save = folder_path
-        user_id_to_save = current_user_id
+        try:
+            if not os.path.exists(full_path_to_check):
+                logger.warning(f"Admin {current_user_id}: Caminho de ingestão não existe (dentro do container): '{full_path_to_check}'")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Pasta não encontrada no servidor: '{project_name}'. Crie-a dentro da pasta 'Captures' e tente novamente."
+                )
+            if not os.path.isdir(full_path_to_check):
+                raise HTTPException(status_code=400, detail="O caminho fornecido é um arquivo, não uma pasta.")
+            if not os.access(full_path_to_check, os.R_OK):
+                raise HTTPException(status_code=403, detail="Permissão negada. O servidor não pode ler essa pasta.")
+        except OSError as e:
+            logger.error(f"Admin {current_user_id}: Erro OSError ao validar o caminho {full_path_to_check}: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro no servidor ao tentar acessar o caminho: {e}")
+        
+        logger.info(f"Admin {current_user_id}: Caminho de ingestão validado com sucesso: {full_path_to_check}")
+        project_name_to_save = project_name
 
     else:
-        logger.info(f"Admin {current_user_id}: Limpando configurações de ingestão (caminho vazio).")
+        logger.info(f"Admin {current_user_id}: Limpando configurações de ingestão (projeto vazio).")
 
     try:
-        set_setting(session, INGEST_FOLDER_KEY, folder_path_to_save)
-        set_setting(session, INGEST_USER_ID_KEY, user_id_to_save)
+        set_setting(session, INGEST_FOLDER_KEY, project_name_to_save)
         set_setting(session, INGEST_PROJECT_NAME_KEY, project_name_to_save) 
+        set_setting(session, INGEST_USER_ID_KEY, current_user_id)
         
         session.commit()
         logger.info(f"Admin {current_user_id}: Configurações de ingestão salvas no DB com sucesso.")

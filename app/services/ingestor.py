@@ -8,12 +8,13 @@ from db.models import db
 from fastapi import UploadFile, HTTPException
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
-from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
 from threading import Timer
 from services.files import _create_file_sync
 from task_runner import run_analysis_task
 from services.settings import get_setting, INGEST_FOLDER_KEY, INGEST_USER_ID_KEY
+from core.config import INGEST_BASE_DIRECTORY
 
 logger = logging.getLogger("sharpshark.ingestor")
 SessionLocal = sessionmaker(bind=db, expire_on_commit=False)
@@ -129,16 +130,20 @@ async def run_ingestor_loop(app):
 
     while True:
         try:
-            folder_to_watch = None
+            project_name_to_watch = None
             user_id_to_assign = None
             session: Session = SessionLocal()
             try:
-                folder_to_watch = get_setting(session, INGEST_FOLDER_KEY)
+                project_name_to_watch = get_setting(session, INGEST_FOLDER_KEY)
                 user_id_to_assign = get_setting(session, INGEST_USER_ID_KEY)
-            except sqlalchemy_exc.SQLAlchemyError as e: logger.error(f"Loop Ingestor: Erro DB: {e}")
-            finally: session.close()
+            except sqlalchemy_exc.SQLAlchemyError as e: 
+                logger.error(f"Loop Ingestor: Erro DB: {e}")
+            finally: 
+                session.close()
 
-            if folder_to_watch: folder_to_watch = os.path.abspath(folder_to_watch)
+            folder_to_watch = None
+            if project_name_to_watch:
+                folder_to_watch = os.path.abspath(os.path.join(INGEST_BASE_DIRECTORY, project_name_to_watch))
 
             observer = getattr(app.state, "current_observer", None)
             current_path = getattr(app.state, "current_watch_path", None)
@@ -146,7 +151,7 @@ async def run_ingestor_loop(app):
 
             if folder_to_watch and user_id_to_assign:
                 if not os.path.isdir(folder_to_watch):
-                    logger.error(f"Loop Ingestor: Pasta '{folder_to_watch}' inválida. Watchdog parado/não iniciado.")
+                    logger.error(f"Loop Ingestor: Pasta '{folder_to_watch}' inválida (Projeto: {project_name_to_watch}). Watchdog parado/não iniciado.")
                     if observer and observer.is_alive():
                         observer.stop(); observer.join()
                         app.state.current_observer = None; app.state.current_watch_path = None; app.state.current_watch_user_id = None
@@ -170,7 +175,7 @@ async def run_ingestor_loop(app):
                             _scan_and_schedule_existing_files(folder_to_watch, user_id_to_assign, app)
                             initial_scan_done_for_path[folder_to_watch] = True
                         else:
-                             logger.debug(f"Loop Ingestor: Scan inicial já realizado para {folder_to_watch}. Pulando.")
+                            logger.debug(f"Loop Ingestor: Scan inicial já realizado para {folder_to_watch}. Pulando.")
 
                     except Exception as e:
                         logger.exception(f"Loop Ingestor: Falha CRÍTICA ao iniciar Watchdog: {e}")
@@ -242,8 +247,8 @@ def _run_ingestion_sync(filepath: str, user_id: str, app):
                     with open(filepath, "rb") as f:
                         file_data = f.read()
                     if len(file_data) != last_size:
-                         logger.error(f"Ingestor Worker (User: {user_id}): Tamanho lido ({len(file_data)}) INCONSISTENTE com tamanho estável ({last_size}) para {filepath}! Abortando.")
-                         return
+                        logger.error(f"Ingestor Worker (User: {user_id}): Tamanho lido ({len(file_data)}) INCONSISTENTE com tamanho estável ({last_size}) para {filepath}! Abortando.")
+                        return
                 except OSError as e:
                     logger.error(f"Ingestor Worker (User: {user_id}): Erro OSError ao LER {filepath} após estabilização: {e}")
                     return
@@ -264,23 +269,23 @@ def _run_ingestion_sync(filepath: str, user_id: str, app):
                 try:
                     os.remove(filepath)
                 except OSError as e:
-                     logger.warning(f"Ingestor Worker (User: {user_id}): Falha ao remover {filepath} da pasta ingest após sucesso: {e}")
+                    logger.warning(f"Ingestor Worker (User: {user_id}): Falha ao remover {filepath} da pasta ingest após sucesso: {e}")
 
             except HTTPException as e_sync:
                 logger.warning(f"Ingestor Worker (User: {user_id}): Falha controlada ({e_sync.status_code}: {e_sync.detail}) ao processar {filepath}.")
                 if e_sync.status_code in [400, 409, 413]:
                     logger.info(f"Ingestor Worker: Removendo arquivo inválido/duplicado/grande da pasta ingest: {filepath}")
                     try:
-                         if os.path.exists(filepath): os.remove(filepath)
+                        if os.path.exists(filepath): os.remove(filepath)
                     except Exception as rm_e:
-                         logger.error(f"Ingestor Worker (User: {user_id}): Falha CRÍTICA ao remover ficheiro inválido {filepath}: {rm_e}")
+                        logger.error(f"Ingestor Worker (User: {user_id}): Falha CRÍTICA ao remover ficheiro inválido {filepath}: {rm_e}")
 
             except Exception as e_general:
-                 logger.exception(f"Ingestor Worker (User: {user_id}): Erro crítico inesperado durante ingestão de {filepath}: {e_general}. Arquivo NÃO será removido.")
+                logger.exception(f"Ingestor Worker (User: {user_id}): Erro crítico inesperado durante ingestão de {filepath}: {e_general}. Arquivo NÃO será removido.")
 
             finally:
                 if 'session' in locals() and session:
                     session.close()
 
     except Exception as e_outer:
-         logger.exception(f"Ingestor Worker (User: {user_id}): Erro irrecuperável (ex: loop de verificação) processando {filepath}: {e_outer}")
+        logger.exception(f"Ingestor Worker (User: {user_id}): Erro irrecuperável (ex: loop de verificação) processando {filepath}: {e_outer}")

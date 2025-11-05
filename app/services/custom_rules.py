@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import exc as sqlalchemy_exc
 from fastapi import HTTPException, status
 from db.models import CustomRule
-from api.schemas.customRuleSchema import CustomRuleCreate
+from api.schemas.customRuleSchema import CustomRuleCreate, CustomRuleUpdate, CustomRuleBase
 from typing import List
 
 logger = logging.getLogger("sharpshark.rules")
@@ -32,6 +32,40 @@ def create_rule(db: Session, rule_data: CustomRuleCreate, user_id: str) -> Custo
             detail=f"Erro ao salvar a regra no banco de dados: {e}"
         )
     return new_rule
+
+def update_rule(db: Session, rule_id: str, rule_data: CustomRuleUpdate) -> CustomRule:
+    logger.info(f"Tentando atualizar regra ID: {rule_id}...")
+    rule = get_rule_by_id(db, rule_id)
+    
+    update_data = rule_data.model_dump(exclude_unset=True)
+
+    if not update_data:
+        logger.warning(f"Nenhuma alteração enviada para regra ID: {rule_id}")
+        return rule
+
+    for key, value in update_data.items():
+        setattr(rule, key, value)
+
+    try:
+        CustomRuleBase.model_validate(rule, from_attributes=True).validate_value_for_type()
+    except ValueError as e:
+        db.rollback()
+        logger.warning(f"Update inválido para regra {rule_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    
+    try:
+        db.commit()
+        db.refresh(rule)
+        logger.info(f"Regra '{rule.name}' (ID: {rule.id}) atualizada com sucesso.")
+    except sqlalchemy_exc.SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Erro DB ao atualizar regra {rule_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao atualizar a regra no banco de dados: {e}"
+        )
+        
+    return rule
 
 def get_rules_query(db: Session):
     return db.query(CustomRule)
