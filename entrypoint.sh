@@ -1,9 +1,8 @@
 #!/bin/bash
-# Em: SharpShark-System/entrypoint.sh
 set -e
 
 ENV_FILE=".env"
-ENV_EXAMPLE_FILE=".env-example" # Este arquivo foi copiado para /app/ pelo Dockerfile
+ENV_EXAMPLE_FILE=".env-example"
 
 # --- 1. SETUP DO .env E SECRET_KEY ---
 if [ ! -f "$ENV_FILE" ]; then
@@ -22,10 +21,9 @@ fi
 
 # --- 2. SETUP DO BANCO DE DADOS ---
 echo "Inicializando o banco de dados (criando tabelas se não existirem)..."
-python3 -m cli init-db  # <-- MUDANÇA (removido 'app.')
+python3 -m cli init-db
 echo "Banco de dados pronto."
 
 # --- 3. INICIA O SERVIDOR ---
 echo "Iniciando servidor Uvicorn em 0.0.0.0:8000..."
-# O "exec" é importante para o Docker parar o container corretamente
-exec uvicorn main:app --host 0.0.0.0 --port 8000 # <-- MUDANÇA (removido 'app.')
+exec uvicorn main:app --host 0.0.0.0 --port 8000 
